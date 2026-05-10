@@ -22,6 +22,11 @@ const STALE_ASSIGNMENT_TIMEOUT_SECONDS = 900;
 /** Default gateway URL embedded in orchestrator push payloads when the orchestrator row has none (deployment-specific). */
 const DEFAULT_WORKER_GATEWAY_BASE_URL = "https://gateway.invalid";
 
+/** Qualified-pool chunk scaling for competition window size (mirrors `QUALIFIED_WINDOW_RATIO` in full BeamCore). */
+const QUALIFIED_WINDOW_RATIO = 0.6;
+/** Floor for qualified competition window (mirrors `MIN_QUALIFIED_WINDOW_SIZE`). */
+const MIN_QUALIFIED_WINDOW_SIZE = 10;
+
 type OrchestratorSession =
 	| { kind: "direct"; ws: OrchestratorWebSocket }
 	| { kind: "relay"; ws: OrchestratorWebSocket };
@@ -62,7 +67,10 @@ function pushToOrchestrator(hotkey: string, msg: unknown): boolean {
 	return true;
 }
 
-export type Db = <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
+type SqlTag = <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
+
+/** Tagged SQL plus optional postgres-style `begin` for qualified transactional ring cursor. */
+export type Db = SqlTag & { begin?: <T>(callback: (sql: SqlTag) => Promise<T>) => Promise<T> };
 
 export interface TransferMetadata {
 	transfer_version?: "legacy" | "signed_url_v1";
@@ -211,7 +219,7 @@ async function isOrchOwnedGateway(db: Db, url: string | null | undefined): Promi
 }
 
 async function listEligibleWorkersForOrchestrator(
-	db: Db,
+	db: SqlTag,
 	gatewayClient: WorkerGatewayClient,
 	orchestratorId: string,
 	excludeWorkerIds: string[] = [],
@@ -302,9 +310,21 @@ interface OrchestratorCandidate {
 	id: string;
 	hotkey: string;
 	gatewayUrl: string | null;
+	uid: number | null;
 	prismFinalScore: string;
 	prismConfidenceScore: string;
 	prismPool: "qualifying" | "qualified";
+}
+
+export interface QualifiedRingSelectionMeta {
+	n: number;
+	totalChunks: number;
+	qualifiedWindowRatio: number;
+	minQualifiedWindowSize: number;
+	competitionWindowSize: number;
+	cursorBeforeMod: bigint;
+	cursorAfterMod: bigint;
+	startIndex: number;
 }
 
 type AssignmentSelectionRule = "prism_final_score_desc" | "qualifying_equal_share_rotation";
@@ -313,6 +333,7 @@ interface SelectionResult {
 	orchestrators: OrchestratorCandidate[];
 	preferredPool: "qualifying" | "qualified";
 	selectionRule: AssignmentSelectionRule;
+	qualifiedRing?: QualifiedRingSelectionMeta;
 	counts: {
 		queried: number;
 		websocketReady: number;
@@ -380,14 +401,48 @@ function hashSeed(seed: string): number {
 	return hash;
 }
 
-function rotateCandidates<T>(candidates: T[], offset: number): T[] {
+export function rotateCandidates<T>(candidates: T[], offset: number): T[] {
 	if (!candidates.length) return [];
 	const normalizedOffset = ((offset % candidates.length) + candidates.length) % candidates.length;
 	if (normalizedOffset === 0) return [...candidates];
 	return [...candidates.slice(normalizedOffset), ...candidates.slice(0, normalizedOffset)];
 }
 
-function allocateChunkSlices(
+function compareUidAscNullsLast(a: number | null, b: number | null): number {
+	if (a === null && b === null) return 0;
+	if (a === null) return 1;
+	if (b === null) return -1;
+	return a - b;
+}
+
+export function computeQualifiedCompetitionWindowSize(
+	totalChunks: number,
+	n: number,
+	qualifiedWindowRatio: number,
+	minQualifiedWindowSize: number,
+): number {
+	if (n <= 0 || totalChunks <= 0) return 0;
+	const scaled = Math.ceil(totalChunks * qualifiedWindowRatio);
+	return Math.min(n, Math.max(minQualifiedWindowSize, scaled));
+}
+
+export function pickQualifiedCompetitionWindow<T>(
+	uidSorted: T[],
+	startIndex: number,
+	competitionWindowSize: number,
+): T[] {
+	if (!uidSorted.length || competitionWindowSize <= 0) return [];
+	return rotateCandidates(uidSorted, startIndex).slice(0, competitionWindowSize);
+}
+
+export function advanceQualifiedRingCursor(cursor: bigint, windowSize: number, n: number): bigint {
+	if (n <= 0) return cursor;
+	const w = BigInt(windowSize);
+	const nn = BigInt(n);
+	return (cursor + w) % nn;
+}
+
+export function allocateChunkSlices(
 	candidates: OrchestratorCandidate[],
 	totalChunks: number,
 	selectionRule: SelectionResult["selectionRule"],
@@ -471,17 +526,21 @@ export class AssignmentEngine {
 	}
 
 	private async selectOrchestrators(
+		sql: SqlTag,
 		testMode: boolean,
 		excludeIds: string[] = [],
 		orderSeed?: string,
+		logicalTotalChunks?: number,
+		qualifiedRingCursorLocked?: bigint,
 	): Promise<SelectionResult> {
 		const preferredPool = testMode ? "qualifying" : "qualified";
 
-		const allCandidates = await this.db<OrchestratorCandidate[]>`
+		const allCandidates = await sql<OrchestratorCandidate[]>`
       SELECT
         o.id,
         o.hotkey,
         o.gateway_url                  AS gateway_url,
+        o.uid                          AS uid,
         o.prism_final_score            AS prism_final_score,
         o.prism_confidence_score       AS prism_confidence_score,
         o.prism_pool                   AS prism_pool
@@ -495,7 +554,7 @@ export class AssignmentEngine {
 		const workerEligibility = await Promise.all(
 			websocketReady.map(async (candidate) => {
 				try {
-					const workers = await listEligibleWorkersForOrchestrator(this.db, this.gatewayClient, candidate.id);
+					const workers = await listEligibleWorkersForOrchestrator(sql, this.gatewayClient, candidate.id);
 					return { candidate, workerCount: workers.length };
 				} catch {
 					return { candidate, workerCount: 0 };
@@ -523,18 +582,53 @@ export class AssignmentEngine {
 			preferredPool === "qualifying"
 				? ("qualifying_equal_share_rotation" as const)
 				: ("prism_final_score_desc" as const);
-		const sorted =
-			selectionRule === "qualifying_equal_share_rotation"
-				? rotateCandidates(
-						[...preferred].sort((a, b) => a.hotkey.localeCompare(b.hotkey) || a.id.localeCompare(b.id)),
-						preferred.length > 0 ? hashSeed(orderSeed ?? "") % preferred.length : 0,
-					)
-				: [...preferred].sort(
-						(a, b) =>
-							numericValue(b.prismFinalScore) - numericValue(a.prismFinalScore) ||
-							a.hotkey.localeCompare(b.hotkey) ||
-							a.id.localeCompare(b.id),
-					);
+
+		let sorted: OrchestratorCandidate[];
+		let qualifiedRing: QualifiedRingSelectionMeta | undefined;
+
+		if (selectionRule === "qualifying_equal_share_rotation") {
+			sorted = rotateCandidates(
+				[...preferred].sort((a, b) => a.hotkey.localeCompare(b.hotkey) || a.id.localeCompare(b.id)),
+				preferred.length > 0 ? hashSeed(orderSeed ?? "") % preferred.length : 0,
+			);
+		} else {
+			const n = preferred.length;
+			if (logicalTotalChunks === undefined || qualifiedRingCursorLocked === undefined) {
+				throw new Error("qualified pool selection requires logicalTotalChunks and locked qualified ring cursor");
+			}
+			const uidSorted = [...preferred].sort(
+				(a, b) =>
+					compareUidAscNullsLast(a.uid, b.uid) ||
+					a.hotkey.localeCompare(b.hotkey) ||
+					a.id.localeCompare(b.id),
+			);
+			const competitionWindowSize = computeQualifiedCompetitionWindowSize(
+				logicalTotalChunks,
+				n,
+				QUALIFIED_WINDOW_RATIO,
+				MIN_QUALIFIED_WINDOW_SIZE,
+			);
+			const nn = BigInt(n);
+			const cursorBeforeMod = qualifiedRingCursorLocked % nn;
+			const startIndex = Number(cursorBeforeMod);
+			sorted = pickQualifiedCompetitionWindow(uidSorted, startIndex, competitionWindowSize);
+			const cursorAfterMod = advanceQualifiedRingCursor(
+				qualifiedRingCursorLocked,
+				competitionWindowSize,
+				n,
+			);
+			qualifiedRing = {
+				n,
+				totalChunks: logicalTotalChunks,
+				qualifiedWindowRatio: QUALIFIED_WINDOW_RATIO,
+				minQualifiedWindowSize: MIN_QUALIFIED_WINDOW_SIZE,
+				competitionWindowSize,
+				cursorBeforeMod,
+				cursorAfterMod,
+				startIndex,
+			};
+		}
+
 		const counts = {
 			queried: allCandidates.length,
 			websocketReady: websocketReady.length,
@@ -552,6 +646,7 @@ export class AssignmentEngine {
 			orchestrators: sorted,
 			preferredPool,
 			selectionRule,
+			qualifiedRing,
 			counts,
 			diagnostics: {
 				queriedHotkeys,
@@ -565,6 +660,7 @@ export class AssignmentEngine {
 	}
 
 	private async assignChunkCoverage(input: {
+		sql: SqlTag;
 		transferId: string;
 		chunkStart: number;
 		totalChunks: number;
@@ -590,7 +686,7 @@ export class AssignmentEngine {
 
 			const chunkStart = remainingChunkStart;
 			const chunkEnd = remainingChunkStart + sliceSize - 1;
-			const assignmentId = await insertTransferAssignment(this.db, {
+			const assignmentId = await insertTransferAssignment(input.sql, {
 				transferId: input.transferId,
 				orchestratorId: orchestrator.id,
 				chunkStart,
@@ -612,8 +708,8 @@ export class AssignmentEngine {
 			});
 
 			if (!pushed) {
-				await this.db`DELETE FROM core.transfer_assignments WHERE id = ${assignmentId}`;
-				await persistAssignmentFailure(this.db, {
+				await input.sql`DELETE FROM core.transfer_assignments WHERE id = ${assignmentId}`;
+				await persistAssignmentFailure(input.sql, {
 					assignmentId,
 					transferId: input.transferId,
 					orchestratorId: orchestrator.id,
@@ -688,50 +784,131 @@ export class AssignmentEngine {
 				reason: "assignment_produced_no_tasks_before_timeout",
 			});
 
-			let selection: SelectionResult;
-			try {
-				selection = await this.selectOrchestrators(
-					testMode,
-					[assignment.orchestratorId],
-					assignment.transferId,
-				);
-				assertRequiredPoolSelection(selection, testMode);
-			} catch {
-				await this.db`
-          UPDATE core.transfer_assignments
-          SET assigned_at = NOW()
-          WHERE id = ${assignment.id}
-        `;
-				continue;
-			}
+			type RedistOk = {
+				ok: true;
+				selection: SelectionResult;
+				redistributed: AssignmentCoverageResult;
+			};
+			type RedistBusy =
+				| { ok: false; kind: "no_orchs" }
+				| {
+						ok: false;
+						kind: "partial_coverage";
+						selection?: SelectionResult;
+						redistributed?: AssignmentCoverageResult;
+				  };
 
-			const redistributed = await this.assignChunkCoverage({
-				transferId: assignment.transferId,
-				chunkStart: assignment.chunkStart,
-				totalChunks: assignment.totalChunks,
-				chunkSize: assignment.chunkSize,
-				metadata: meta,
-				orchestrators: selection.orchestrators,
-				selectionRule: selection.selectionRule,
-			});
-
-			if (!redistributed.coveredAllChunks) {
-				await this.db`
-          UPDATE core.transfer_assignments
-          SET assigned_at = NOW()
-          WHERE id = ${assignment.id}
-        `;
-				if (redistributed.assignmentIds.length > 0) {
-					await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${redistributed.assignmentIds})`;
+			const tryRedistributeSql = async (
+				sql: SqlTag,
+				lockedRingCursor?: bigint,
+			): Promise<RedistOk | RedistBusy> => {
+				let selection: SelectionResult;
+				try {
+					if (testMode) {
+						selection = await this.selectOrchestrators(sql, true, [assignment.orchestratorId], assignment.transferId);
+					} else if (lockedRingCursor !== undefined) {
+						selection = await this.selectOrchestrators(
+							sql,
+							false,
+							[assignment.orchestratorId],
+							assignment.transferId,
+							assignment.totalChunks,
+							lockedRingCursor,
+						);
+					} else {
+						throw new Error("qualified redistribution requires locked ring cursor");
+					}
+					assertRequiredPoolSelection(selection, testMode);
+				} catch {
+					return { ok: false, kind: "no_orchs" };
 				}
+
+				const redistributed = await this.assignChunkCoverage({
+					sql,
+					transferId: assignment.transferId,
+					chunkStart: assignment.chunkStart,
+					totalChunks: assignment.totalChunks,
+					chunkSize: assignment.chunkSize,
+					metadata: meta,
+					orchestrators: selection.orchestrators,
+					selectionRule: selection.selectionRule,
+				});
+
+				if (!redistributed.coveredAllChunks) {
+					return { ok: false, kind: "partial_coverage", selection, redistributed };
+				}
+				return { ok: true, selection, redistributed };
+			};
+
+			if (testMode) {
+				const result = await tryRedistributeSql(this.db);
+				if (!result.ok) {
+					if (result.kind === "partial_coverage" && result.redistributed?.assignmentIds.length) {
+						await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${result.redistributed.assignmentIds})`;
+					}
+					await this.db`
+						UPDATE core.transfer_assignments
+						SET assigned_at = NOW()
+						WHERE id = ${assignment.id}
+					`;
+					continue;
+				}
+				await this.db`
+					UPDATE core.transfer_assignments
+					SET status = 'expired'
+					WHERE id = ${assignment.id}
+				`;
 				continue;
 			}
 
-			await this.db`
-        UPDATE core.transfer_assignments
-				SET status = 'expired'
-        WHERE id = ${assignment.id}
-      `;
+			const beginFn = this.db.begin;
+			if (!beginFn) {
+				throw new Error(
+					"AssignmentEngine: db.begin(...) is required for qualified-pool stale assignment redistribution",
+				);
+			}
+
+			try {
+				await beginFn.call(this.db, async (sql: SqlTag) => {
+					const [ringRow] = await sql<{ qualifiedRingCursor: string }[]>`
+						SELECT qualified_ring_cursor FROM core.qualified_assignment_ring WHERE singleton = TRUE FOR UPDATE
+					`;
+					const lockedCursor = BigInt(ringRow?.qualifiedRingCursor ?? "0");
+
+					const outcome = await tryRedistributeSql(sql, lockedCursor);
+					if (!outcome.ok) {
+						throw Object.assign(new Error("__REDIST_RETRY__"), { outcome });
+					}
+
+					const q = outcome.selection.qualifiedRing;
+					if (q) {
+						const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
+						await sql`
+							UPDATE core.qualified_assignment_ring
+							SET qualified_ring_cursor = ${nextStored}
+							WHERE singleton = TRUE
+						`;
+					}
+
+					await sql`
+						UPDATE core.transfer_assignments
+						SET status = 'expired'
+						WHERE id = ${assignment.id}
+					`;
+				});
+			} catch (e) {
+				if ((e as Error)?.message !== "__REDIST_RETRY__") throw e;
+				const tagged = e as Error & { outcome?: RedistBusy };
+				const out = tagged.outcome;
+				if (out?.kind === "partial_coverage" && out.redistributed?.assignmentIds.length) {
+					await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${out.redistributed.assignmentIds})`;
+				}
+				await this.db`
+					UPDATE core.transfer_assignments
+					SET assigned_at = NOW()
+					WHERE id = ${assignment.id}
+				`;
+			}
 		}
 	}
 
@@ -759,35 +936,117 @@ export class AssignmentEngine {
 				? metadata.logical_chunk_count
 				: transfer.totalChunks;
 
-		const selection = await this.selectOrchestrators(testMode, [], transferId);
-		assertRequiredPoolSelection(selection, testMode);
+		if (testMode) {
+			const selection = await this.selectOrchestrators(this.db, testMode, [], transferId);
+			assertRequiredPoolSelection(selection, testMode);
 
-		const coverage = await this.assignChunkCoverage({
-			transferId,
-			chunkStart: 0,
-			totalChunks: logicalTotalChunks,
-			chunkSize: transfer.chunkSize,
-			metadata,
-			orchestrators: selection.orchestrators,
-			selectionRule: selection.selectionRule,
-		});
+			const coverage = await this.assignChunkCoverage({
+				sql: this.db,
+				transferId,
+				chunkStart: 0,
+				totalChunks: logicalTotalChunks,
+				chunkSize: transfer.chunkSize,
+				metadata,
+				orchestrators: selection.orchestrators,
+				selectionRule: selection.selectionRule,
+			});
 
-		if (!coverage.coveredAllChunks) {
-			if (coverage.assignmentIds.length > 0) {
-				await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${coverage.assignmentIds})`;
+			if (!coverage.coveredAllChunks) {
+				if (coverage.assignmentIds.length > 0) {
+					await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${coverage.assignmentIds})`;
+				}
+				throw new Error(
+					"transfer assignment failed because not all chunks could be assigned to live orchestrators",
+				);
 			}
+
+			await this.db`
+				UPDATE core.transfers
+				SET status = 'in_progress', started_at = NOW()
+				WHERE id = ${transferId}
+			`;
+
+			return coverage.assignmentIds;
+		}
+
+		const beginFn = this.db.begin;
+		if (!beginFn) {
 			throw new Error(
-				"transfer assignment failed because not all chunks could be assigned to live orchestrators",
+				"AssignmentEngine: db.begin(...) is required for qualified-pool transfer assignment",
 			);
 		}
 
-		await this.db`
-      UPDATE core.transfers
-      SET status = 'in_progress', started_at = NOW()
-      WHERE id = ${transferId}
-    `;
+		type CapturedAssign = {
+			assignmentIds: string[];
+			coverage: AssignmentCoverageResult;
+		};
+		let captured: CapturedAssign | null = null;
 
-		return coverage.assignmentIds;
+		try {
+			await beginFn.call(this.db, async (sql: SqlTag) => {
+				const [ringRow] = await sql<{ qualifiedRingCursor: string }[]>`
+					SELECT qualified_ring_cursor FROM core.qualified_assignment_ring WHERE singleton = TRUE FOR UPDATE
+				`;
+				const lockedCursor = BigInt(ringRow?.qualifiedRingCursor ?? "0");
+
+				const selection = await this.selectOrchestrators(
+					sql,
+					false,
+					[],
+					transferId,
+					logicalTotalChunks,
+					lockedCursor,
+				);
+				assertRequiredPoolSelection(selection, false);
+
+				const coverage = await this.assignChunkCoverage({
+					sql,
+					transferId,
+					chunkStart: 0,
+					totalChunks: logicalTotalChunks,
+					chunkSize: transfer.chunkSize,
+					metadata,
+					orchestrators: selection.orchestrators,
+					selectionRule: selection.selectionRule,
+				});
+
+				if (!coverage.coveredAllChunks) {
+					throw new Error("__ASSIGN_COVERAGE_FAIL__");
+				}
+
+				const q = selection.qualifiedRing;
+				if (!q) {
+					throw new Error("qualified assignment missing qualifiedRing metadata");
+				}
+				const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
+				await sql`
+					UPDATE core.qualified_assignment_ring
+					SET qualified_ring_cursor = ${nextStored}
+					WHERE singleton = TRUE
+				`;
+
+				await sql`
+					UPDATE core.transfers
+					SET status = 'in_progress', started_at = NOW()
+					WHERE id = ${transferId}
+				`;
+
+				captured = { assignmentIds: coverage.assignmentIds, coverage };
+			});
+		} catch (e) {
+			if ((e as Error)?.message === "__ASSIGN_COVERAGE_FAIL__") {
+				throw new Error(
+					"transfer assignment failed because not all chunks could be assigned to live orchestrators",
+				);
+			}
+			throw e;
+		}
+
+		if (!captured) {
+			throw new Error("assignTransfer qualified path produced no captured result");
+		}
+
+		return captured.assignmentIds;
 	}
 
 	async reassignTask(taskId: string, excludeWorkerId?: string): Promise<void> {

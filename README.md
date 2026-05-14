@@ -2,7 +2,7 @@
 
 Public reference code for two parts of BeamCore: **transfer assignment** (orchestrator selection, chunk allocation, stale reassignment) and **PRISM** (scoring logic and the scheduled metrics refresh).
 
-This repository is not a runnable service. Dependencies, scheduler wiring, and some modules are omitted or inlined.
+These files are maintained as self-contained public copies of the current BeamCore logic. This repository is not a runnable service; dependencies, scheduler wiring, and some modules are omitted or inlined.
 
 ## Files
 

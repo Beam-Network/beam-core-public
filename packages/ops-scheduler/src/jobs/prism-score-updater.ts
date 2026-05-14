@@ -32,53 +32,53 @@ interface OrchestratorRow {
 	id: string;
 	hotkey: string;
 	ready: boolean;
-	registeredAt: Date;
-	connectedWorkers: number;
+	registered_at: Date;
+	connected_workers: number;
 }
 
 interface ProofRow {
-	orchestratorId: string;
-	transferId: string | null;
-	bandwidthMbps: string;
-	eventAt: Date;
+	orchestrator_id: string;
+	transfer_id: string | null;
+	bandwidth_mbps: string;
+	event_at: Date;
 }
 
 interface TaskRow {
-	orchestratorId: string;
+	orchestrator_id: string;
 	state: "completed" | "failed";
-	failureReason: string | null;
-	eventAt: Date;
+	failure_reason: string | null;
+	event_at: Date;
 }
 
 interface PaymentPenaltyRow {
-	orchestratorId: string;
-	failedPopPayments: number;
+	orchestrator_id: string;
+	failed_pop_payments: number;
 }
 
 interface FraudPenaltyRow {
-	orchestratorId: string;
-	fraudPenaltyEvents: number;
+	orchestrator_id: string;
+	fraud_penalty_events: number;
 }
 
 interface SybilPenaltyRow {
-	orchestratorId: string;
-	sybilViolationEvents: number;
+	orchestrator_id: string;
+	sybil_violation_events: number;
 }
 
 interface GuardrailPenaltyRow {
-	orchestratorId: string;
-	guardrailInterventionEvents: number;
+	orchestrator_id: string;
+	guardrail_intervention_events: number;
 }
 
 interface PreviousMetricRow {
-	orchestratorId: string;
-	prismFinalScore: string;
-	confidenceScore: string;
-	throughputScore: string;
-	reliabilityScore: string;
-	performanceScore: string;
-	readinessMultiplier: string;
-	penaltyMultiplier: string;
+	orchestrator_id: string;
+	prism_final_score: string;
+	confidence_score: string;
+	throughput_score: string;
+	reliability_score: string;
+	performance_score: string;
+	readiness_multiplier: string;
+	penalty_multiplier: string;
 }
 
 interface PreviousMetricValues {
@@ -124,29 +124,29 @@ async function materializePopPenaltyEvents(args: {
 	const currentEpoch =
 		args.currentEpoch ??
 		(
-			await db<{ currentEpoch: number | null }[]>`
-				SELECT current_epoch AS "currentEpoch"
+			await db<{ current_epoch: number | null }[]>`
+				SELECT current_epoch
 				FROM core.chain_state
 				ORDER BY last_synced_at DESC
 				LIMIT 1
 			`
-		)[0]?.currentEpoch ??
+		)[0]?.current_epoch ??
 		null;
 
 	if (currentEpoch == null || currentEpoch <= 0) return 0;
 
-	const insertedRows = await db<{ workerPaymentId: string }[]>`
+	const insertedRows = await db<{ worker_payment_id: string }[]>`
 		WITH pending_events AS (
 			SELECT
-				wp.id AS "workerPaymentId",
-				wp.orchestrator_id AS "orchestratorId",
-				wp.worker_id AS "workerId",
-				wp.task_id AS "taskId",
-				wp.tx_hash AS "txHash",
-				wp.epoch AS "paymentEpoch",
-				wp.created_at AS "paymentRecordedAt",
-				COALESCE(wp.pop_verified_at, wp.updated_at, wp.created_at) AS "resolvedAt",
-				wp.pop_error AS "verifierError"
+				wp.id AS worker_payment_id,
+				wp.orchestrator_id AS orchestrator_id,
+				wp.worker_id AS worker_id,
+				wp.task_id AS task_id,
+				wp.tx_hash AS tx_hash,
+				wp.epoch AS payment_epoch,
+				wp.created_at AS payment_recorded_at,
+				COALESCE(wp.pop_verified_at, wp.updated_at, wp.created_at) AS resolved_at,
+				wp.pop_error AS verifier_error
 			FROM core.worker_payments wp
 			WHERE wp.pop_verified = FALSE
 				AND wp.task_id IS NOT NULL
@@ -163,19 +163,19 @@ async function materializePopPenaltyEvents(args: {
 			(worker_payment_id, orchestrator_id, worker_id, task_id, tx_hash,
 			 payment_epoch, payment_recorded_at, resolved_at, applied_in_epoch, verifier_error)
 		SELECT
-			"workerPaymentId",
-			"orchestratorId",
-			"workerId",
-			"taskId",
-			"txHash",
-			"paymentEpoch",
-			"paymentRecordedAt",
-			"resolvedAt",
+			worker_payment_id,
+			orchestrator_id,
+			worker_id,
+			task_id,
+			tx_hash,
+			payment_epoch,
+			payment_recorded_at,
+			resolved_at,
 			${currentEpoch},
-			"verifierError"
+			verifier_error
 		FROM pending_events
 		ON CONFLICT (worker_payment_id) DO NOTHING
-		RETURNING worker_payment_id AS "workerPaymentId"
+		RETURNING worker_payment_id
 	`;
 
 	return insertedRows.length;
@@ -183,40 +183,40 @@ async function materializePopPenaltyEvents(args: {
 
 export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	const now = new Date();
-	const chainRows = await db<{ currentEpoch: number | null }[]>`
-		SELECT current_epoch AS "currentEpoch"
+	const chainRows = await db<{ current_epoch: number | null }[]>`
+		SELECT current_epoch
 		FROM core.chain_state
 		ORDER BY last_synced_at DESC
 		LIMIT 1
 	`;
-	const currentEpoch = chainRows[0]?.currentEpoch ?? 0;
+	const currentEpoch = chainRows[0]?.current_epoch ?? 0;
 
 	await materializePopPenaltyEvents({ db, currentEpoch });
 
 	const previousMetrics = await db<PreviousMetricRow[]>`
 		SELECT
-			orchestrator_id        AS "orchestratorId",
-			prism_final_score      AS "prismFinalScore",
-			confidence_score       AS "confidenceScore",
-			throughput_score       AS "throughputScore",
-			reliability_score      AS "reliabilityScore",
-			performance_score      AS "performanceScore",
-			readiness_multiplier   AS "readinessMultiplier",
-			penalty_multiplier     AS "penaltyMultiplier"
+			orchestrator_id,
+			prism_final_score,
+			confidence_score,
+			throughput_score,
+			reliability_score,
+			performance_score,
+			readiness_multiplier,
+			penalty_multiplier
 		FROM core.beam_prism_metrics
 	`;
 
 	const previousByOrchestrator = new Map<string, PreviousMetricValues>(
 		previousMetrics.map((row) => [
-			row.orchestratorId,
+			row.orchestrator_id,
 			{
-				prism_final_score: numberValue(row.prismFinalScore),
-				confidence_score: numberValue(row.confidenceScore),
-				throughput_score: numberValue(row.throughputScore),
-				reliability_score: numberValue(row.reliabilityScore),
-				performance_score: numberValue(row.performanceScore),
-				readiness_multiplier: numberValue(row.readinessMultiplier),
-				penalty_multiplier: numberValue(row.penaltyMultiplier),
+				prism_final_score: numberValue(row.prism_final_score),
+				confidence_score: numberValue(row.confidence_score),
+				throughput_score: numberValue(row.throughput_score),
+				reliability_score: numberValue(row.reliability_score),
+				performance_score: numberValue(row.performance_score),
+				readiness_multiplier: numberValue(row.readiness_multiplier),
+				penalty_multiplier: numberValue(row.penalty_multiplier),
 			},
 		]),
 	);
@@ -228,7 +228,7 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
           o.id,
           o.hotkey,
           o.ready,
-          o.registered_at AS "registeredAt",
+					o.registered_at,
           (
             SELECT COUNT(*)::INT
             FROM core.worker_sessions ws
@@ -239,15 +239,15 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
                 WHERE e.worker_id = w.worker_id
                   AND e.orchestrator_id = o.id
               )
-          ) AS "connectedWorkers"
+					) AS connected_workers
         FROM core.orchestrators o
       `,
 			db<ProofRow[]>`
         SELECT
-          p.orchestrator_id AS "orchestratorId",
-          t.transfer_id     AS "transferId",
-          COALESCE(p.bandwidth_mbps, 0)::TEXT AS "bandwidthMbps",
-          COALESCE(p.verified_at, p.published_at) AS "eventAt"
+					p.orchestrator_id,
+					t.transfer_id,
+					COALESCE(p.bandwidth_mbps, 0)::TEXT AS bandwidth_mbps,
+					COALESCE(p.verified_at, p.published_at) AS event_at
         FROM core.proofs_of_bandwidth p
         LEFT JOIN core.tasks t ON t.id = p.task_id
         WHERE COALESCE(p.verified_at, p.published_at) > NOW() - ${LOOKBACK_WINDOW}::INTERVAL
@@ -255,34 +255,34 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
       `,
 			db<TaskRow[]>`
         SELECT
-          orchestrator_id AS "orchestratorId",
+					orchestrator_id,
           state,
-          failure_reason AS "failureReason",
-          COALESCE(completed_at, failed_at, created_at) AS "eventAt"
+					failure_reason,
+					COALESCE(completed_at, failed_at, created_at) AS event_at
         FROM core.tasks
         WHERE COALESCE(completed_at, failed_at, created_at) > NOW() - ${LOOKBACK_WINDOW}::INTERVAL
           AND state IN ('completed', 'failed')
         UNION ALL
         SELECT
-          orchestrator_id AS "orchestratorId",
+					orchestrator_id,
           'failed' AS state,
-          CONCAT('beamcore_guardrail_reassign:', COALESCE(reason, outcome)) AS "failureReason",
-          intervened_at AS "eventAt"
+					CONCAT('beamcore_guardrail_reassign:', COALESCE(reason, outcome)) AS failure_reason,
+					intervened_at AS event_at
         FROM core.orchestrator_guardrail_interventions
         WHERE intervened_at > NOW() - ${LOOKBACK_WINDOW}::INTERVAL
 			UNION ALL
 			SELECT
-			  orchestrator_id AS "orchestratorId",
+			  orchestrator_id,
 			  'failed' AS state,
-			  CONCAT('assignment_failure:', COALESCE(failure_type, 'unknown'), ':', COALESCE(reason, 'unknown')) AS "failureReason",
-			  created_at AS "eventAt"
+			  CONCAT('assignment_failure:', COALESCE(failure_type, 'unknown'), ':', COALESCE(reason, 'unknown')) AS failure_reason,
+			  created_at AS event_at
 			FROM core.orchestrator_assignment_failures
 			WHERE created_at > NOW() - ${LOOKBACK_WINDOW}::INTERVAL
       `,
 			db<PaymentPenaltyRow[]>`
         SELECT
-          orchestrator_id AS "orchestratorId",
-					COUNT(*)::INT AS "failedPopPayments"
+			  orchestrator_id,
+					COUNT(*)::INT AS failed_pop_payments
         FROM core.pop_penalty_events
         WHERE applied_in_epoch <= ${currentEpoch}
           AND resolved_at > NOW() - ${PENALTY_LOOKBACK_WINDOW}::INTERVAL
@@ -290,8 +290,8 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
       `,
 			db<FraudPenaltyRow[]>`
         SELECT
-          orchestrator_id AS "orchestratorId",
-          COUNT(*)::INT AS "fraudPenaltyEvents"
+			  orchestrator_id,
+					COUNT(*)::INT AS fraud_penalty_events
         FROM core.fraud_penalties
         WHERE orchestrator_id IS NOT NULL
           AND applied_at > NOW() - ${PENALTY_LOOKBACK_WINDOW}::INTERVAL
@@ -299,8 +299,8 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
       `,
 			db<SybilPenaltyRow[]>`
         SELECT
-          t.orchestrator_id AS "orchestratorId",
-          COUNT(DISTINCT sv.id)::INT AS "sybilViolationEvents"
+			  t.orchestrator_id,
+					COUNT(DISTINCT sv.id)::INT AS sybil_violation_events
         FROM core.sybil_violations sv
         JOIN core.tasks t ON t.assigned_worker_id = sv.worker_id
         WHERE sv.resolved_at IS NULL
@@ -309,8 +309,8 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
       `,
 			db<GuardrailPenaltyRow[]>`
         SELECT
-          orchestrator_id AS "orchestratorId",
-          COUNT(*)::INT AS "guardrailInterventionEvents"
+			  orchestrator_id,
+					COUNT(*)::INT AS guardrail_intervention_events
         FROM core.orchestrator_guardrail_interventions
         WHERE intervened_at > NOW() - ${PENALTY_LOOKBACK_WINDOW}::INTERVAL
         GROUP BY orchestrator_id
@@ -324,13 +324,13 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 
 	for (const proof of proofs) {
 		const sample: PrismProofSample = {
-			bandwidthMbps: numberValue(proof.bandwidthMbps),
-			transferId: proof.transferId,
-			eventAt: proof.eventAt,
+			bandwidthMbps: numberValue(proof.bandwidth_mbps),
+			transferId: proof.transfer_id,
+			eventAt: proof.event_at,
 		};
-		const existing = proofsByOrchestrator.get(proof.orchestratorId) ?? [];
+		const existing = proofsByOrchestrator.get(proof.orchestrator_id) ?? [];
 		existing.push(sample);
-		proofsByOrchestrator.set(proof.orchestratorId, existing);
+		proofsByOrchestrator.set(proof.orchestrator_id, existing);
 	}
 
 	for (const [orchestratorId, orchestratorProofs] of proofsByOrchestrator.entries()) {
@@ -344,17 +344,17 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	for (const task of tasks) {
 		const sample: PrismTaskSample = {
 			state: task.state,
-			failureReason: task.failureReason,
-			eventAt: task.eventAt,
+			failureReason: task.failure_reason,
+			eventAt: task.event_at,
 		};
-		const existing = tasksByOrchestrator.get(task.orchestratorId) ?? [];
+		const existing = tasksByOrchestrator.get(task.orchestrator_id) ?? [];
 		existing.push(sample);
-		tasksByOrchestrator.set(task.orchestratorId, existing);
+		tasksByOrchestrator.set(task.orchestrator_id, existing);
 	}
 
 	for (const row of paymentPenalties) {
-		penaltyByOrchestrator.set(row.orchestratorId, {
-			failedPopPayments: row.failedPopPayments,
+		penaltyByOrchestrator.set(row.orchestrator_id, {
+			failedPopPayments: row.failed_pop_payments,
 			fraudPenaltyEvents: 0,
 			sybilViolationEvents: 0,
 			guardrailInterventionEvents: 0,
@@ -362,36 +362,36 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	}
 
 	for (const row of fraudPenalties) {
-		const existing = penaltyByOrchestrator.get(row.orchestratorId) ?? {
+		const existing = penaltyByOrchestrator.get(row.orchestrator_id) ?? {
 			failedPopPayments: 0,
 			fraudPenaltyEvents: 0,
 			sybilViolationEvents: 0,
 			guardrailInterventionEvents: 0,
 		};
-		existing.fraudPenaltyEvents = row.fraudPenaltyEvents;
-		penaltyByOrchestrator.set(row.orchestratorId, existing);
+		existing.fraudPenaltyEvents = row.fraud_penalty_events;
+		penaltyByOrchestrator.set(row.orchestrator_id, existing);
 	}
 
 	for (const row of sybilPenalties) {
-		const existing = penaltyByOrchestrator.get(row.orchestratorId) ?? {
+		const existing = penaltyByOrchestrator.get(row.orchestrator_id) ?? {
 			failedPopPayments: 0,
 			fraudPenaltyEvents: 0,
 			sybilViolationEvents: 0,
 			guardrailInterventionEvents: 0,
 		};
-		existing.sybilViolationEvents = row.sybilViolationEvents;
-		penaltyByOrchestrator.set(row.orchestratorId, existing);
+		existing.sybilViolationEvents = row.sybil_violation_events;
+		penaltyByOrchestrator.set(row.orchestrator_id, existing);
 	}
 
 	for (const row of guardrailPenalties) {
-		const existing = penaltyByOrchestrator.get(row.orchestratorId) ?? {
+		const existing = penaltyByOrchestrator.get(row.orchestrator_id) ?? {
 			failedPopPayments: 0,
 			fraudPenaltyEvents: 0,
 			sybilViolationEvents: 0,
 			guardrailInterventionEvents: 0,
 		};
-		existing.guardrailInterventionEvents = row.guardrailInterventionEvents;
-		penaltyByOrchestrator.set(row.orchestratorId, existing);
+		existing.guardrailInterventionEvents = row.guardrail_intervention_events;
+		penaltyByOrchestrator.set(row.orchestrator_id, existing);
 	}
 
 	const throughputValues = [...averageMbpsByOrchestrator.values()].filter((value) => value > 0);
@@ -414,9 +414,9 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 			},
 			readiness: {
 				ready: orchestrator.ready,
-				connectedWorkers: orchestrator.connectedWorkers,
+				connectedWorkers: orchestrator.connected_workers,
 			},
-			registeredAt: orchestrator.registeredAt,
+			registeredAt: orchestrator.registered_at,
 			now,
 		};
 		const score = computePrismScore(scoreInput);

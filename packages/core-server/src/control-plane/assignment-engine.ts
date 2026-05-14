@@ -13,14 +13,14 @@ interface OrchestratorWebSocket {
 	send(data: string): void;
 }
 
-/** Control-plane public gateway URL baseline for orchestrator-owned gateway detection (deployment-specific). */
-const CONTROL_PLANE_PUBLIC_GATEWAY_URL = "https://gateway.invalid";
+/** Default public worker gateway URL from BeamCore's current local configuration. */
+const CONTROL_PLANE_PUBLIC_GATEWAY_URL = "http://localhost:8001";
 
-/** Seconds after assignment creation without a related task before stale redistribution (deployment-specific). */
-const STALE_ASSIGNMENT_TIMEOUT_SECONDS = 900;
+/** Seconds after assignment creation without a related task before stale redistribution. */
+const STALE_ASSIGNMENT_TIMEOUT_SECONDS = 10;
 
-/** Default gateway URL embedded in orchestrator push payloads when the orchestrator row has none (deployment-specific). */
-const DEFAULT_WORKER_GATEWAY_BASE_URL = "https://gateway.invalid";
+/** Default gateway URL embedded in orchestrator push payloads when the orchestrator row has none. */
+const DEFAULT_WORKER_GATEWAY_BASE_URL = CONTROL_PLANE_PUBLIC_GATEWAY_URL;
 
 /** Qualified-pool chunk scaling for competition window size (mirrors `QUALIFIED_WINDOW_RATIO` in full BeamCore). */
 const QUALIFIED_WINDOW_RATIO = 0.6;
@@ -224,13 +224,13 @@ async function listEligibleWorkersForOrchestrator(
 	orchestratorId: string,
 	excludeWorkerIds: string[] = [],
 ): Promise<WorkerPoolEntry[]> {
-	const orchRows = await db<{ gatewayUrl: string | null }[]>`
+	const orchRows = await db<{ gateway_url: string | null }[]>`
 		SELECT gateway_url AS gateway_url
 		FROM core.orchestrators
 		WHERE id = ${orchestratorId}
 		LIMIT 1
 	`;
-	const orchGatewayUrl = orchRows[0]?.gatewayUrl ?? null;
+	const orchGatewayUrl = orchRows[0]?.gateway_url ?? null;
 	const ownsGateway = await isOrchOwnedGateway(db, orchGatewayUrl);
 	const gatewaySessions = await gatewayClient.getConnectedSessions().catch(() => []);
 	const connectedIds = gatewaySessions
@@ -309,11 +309,11 @@ export interface AssignmentEngineDeps {
 interface OrchestratorCandidate {
 	id: string;
 	hotkey: string;
-	gatewayUrl: string | null;
+	gateway_url: string | null;
 	uid: number | null;
-	prismFinalScore: string;
-	prismConfidenceScore: string;
-	prismPool: "qualifying" | "qualified";
+	prism_final_score: string;
+	prism_confidence_score: string;
+	prism_pool: "qualifying" | "qualified";
 }
 
 export interface QualifiedRingSelectionMeta {
@@ -349,6 +349,19 @@ interface SelectionResult {
 		missingWorkerHotkeys: string[];
 		connectedRegistryHotkeys: string[];
 	};
+}
+
+const COVERAGE_FAILURE_MESSAGE =
+	"transfer assignment failed because not all chunks could be assigned to live orchestrators";
+
+function isTerminalAssignmentFailure(error: unknown): error is Error {
+	if (!(error instanceof Error)) return false;
+	return (
+		error.message === COVERAGE_FAILURE_MESSAGE ||
+		/^no ready (qualifying|qualified) orchestrators available for (test|production) transfers$/.test(
+			error.message,
+		)
+	);
 }
 
 interface TransferAssignmentSlice {
@@ -387,7 +400,7 @@ function summarizeAssignmentSlice(
 	return {
 		orchestratorId: candidate.id,
 		hotkey: candidate.hotkey,
-		prismPool: candidate.prismPool,
+		prismPool: candidate.prism_pool,
 		chunkRange: `${chunkStart}-${chunkEnd}`,
 		sliceSize,
 	};
@@ -461,7 +474,7 @@ export function allocateChunkSlices(
 		return sliceSizes;
 	}
 
-	const scores = activeCandidates.map((c) => Math.max(0, numericValue(c.prismFinalScore)));
+	const scores = activeCandidates.map((c) => Math.max(0, numericValue(c.prism_final_score)));
 	const activeSlices = computePrismSlices(scores, totalChunks);
 	for (let i = 0; i < activeCount; i++) {
 		sliceSizes[i] = activeSlices[i] ?? 0;
@@ -470,7 +483,7 @@ export function allocateChunkSlices(
 }
 
 function assertRequiredPoolSelection(selection: SelectionResult, testMode: boolean) {
-	const wrongPool = selection.orchestrators.filter((candidate) => candidate.prismPool !== selection.preferredPool);
+	const wrongPool = selection.orchestrators.filter((candidate) => candidate.prism_pool !== selection.preferredPool);
 	if (!selection.orchestrators.length || wrongPool.length > 0) {
 		const transferClass = testMode ? "test" : "production";
 		throw new Error(`no ready ${selection.preferredPool} orchestrators available for ${transferClass} transfers`);
@@ -525,6 +538,17 @@ export class AssignmentEngine {
 		this.gatewayClient = deps.gatewayClient;
 	}
 
+	private async failTransferAssignment(transferId: string, reason: string): Promise<void> {
+		await this.db`
+			UPDATE core.transfers
+			SET status = 'failed',
+					error_message = ${reason},
+					completed_at = COALESCE(completed_at, NOW())
+			WHERE id = ${transferId}
+				AND status NOT IN ('completed', 'failed', 'cancelled')
+		`;
+	}
+
 	private async selectOrchestrators(
 		sql: SqlTag,
 		testMode: boolean,
@@ -545,8 +569,7 @@ export class AssignmentEngine {
         o.prism_confidence_score       AS prism_confidence_score,
         o.prism_pool                   AS prism_pool
       FROM core.orchestrators o
-      WHERE o.status = 'active'
-        AND o.ready = TRUE
+			WHERE o.ready = TRUE
         AND (${excludeIds.length} = 0 OR o.id != ALL(${excludeIds}))
     `;
 
@@ -575,8 +598,8 @@ export class AssignmentEngine {
 
 		const preferred = eligible.filter(
 			(c) =>
-				c.prismPool === preferredPool &&
-				(preferredPool === "qualifying" || numericValue(c.prismFinalScore) > 0),
+				c.prism_pool === preferredPool &&
+				(preferredPool === "qualifying" || numericValue(c.prism_final_score) > 0),
 		);
 		const selectionRule =
 			preferredPool === "qualifying"
@@ -593,40 +616,44 @@ export class AssignmentEngine {
 			);
 		} else {
 			const n = preferred.length;
-			if (logicalTotalChunks === undefined || qualifiedRingCursorLocked === undefined) {
-				throw new Error("qualified pool selection requires logicalTotalChunks and locked qualified ring cursor");
+			if (n === 0) {
+				sorted = [];
+			} else {
+				if (logicalTotalChunks === undefined || qualifiedRingCursorLocked === undefined) {
+					throw new Error("qualified pool selection requires logicalTotalChunks and locked qualified ring cursor");
+				}
+				const uidSorted = [...preferred].sort(
+					(a, b) =>
+						compareUidAscNullsLast(a.uid, b.uid) ||
+						a.hotkey.localeCompare(b.hotkey) ||
+						a.id.localeCompare(b.id),
+				);
+				const competitionWindowSize = computeQualifiedCompetitionWindowSize(
+					logicalTotalChunks,
+					n,
+					QUALIFIED_WINDOW_RATIO,
+					MIN_QUALIFIED_WINDOW_SIZE,
+				);
+				const nn = BigInt(n);
+				const cursorBeforeMod = qualifiedRingCursorLocked % nn;
+				const startIndex = Number(cursorBeforeMod);
+				sorted = pickQualifiedCompetitionWindow(uidSorted, startIndex, competitionWindowSize);
+				const cursorAfter = advanceQualifiedRingCursor(
+					qualifiedRingCursorLocked,
+					competitionWindowSize,
+					n,
+				);
+				qualifiedRing = {
+					n,
+					totalChunks: logicalTotalChunks,
+					qualifiedWindowRatio: QUALIFIED_WINDOW_RATIO,
+					minQualifiedWindowSize: MIN_QUALIFIED_WINDOW_SIZE,
+					competitionWindowSize,
+					cursorBeforeMod,
+					cursorAfterMod: cursorAfter % nn,
+					startIndex,
+				};
 			}
-			const uidSorted = [...preferred].sort(
-				(a, b) =>
-					compareUidAscNullsLast(a.uid, b.uid) ||
-					a.hotkey.localeCompare(b.hotkey) ||
-					a.id.localeCompare(b.id),
-			);
-			const competitionWindowSize = computeQualifiedCompetitionWindowSize(
-				logicalTotalChunks,
-				n,
-				QUALIFIED_WINDOW_RATIO,
-				MIN_QUALIFIED_WINDOW_SIZE,
-			);
-			const nn = BigInt(n);
-			const cursorBeforeMod = qualifiedRingCursorLocked % nn;
-			const startIndex = Number(cursorBeforeMod);
-			sorted = pickQualifiedCompetitionWindow(uidSorted, startIndex, competitionWindowSize);
-			const cursorAfterMod = advanceQualifiedRingCursor(
-				qualifiedRingCursorLocked,
-				competitionWindowSize,
-				n,
-			);
-			qualifiedRing = {
-				n,
-				totalChunks: logicalTotalChunks,
-				qualifiedWindowRatio: QUALIFIED_WINDOW_RATIO,
-				minQualifiedWindowSize: MIN_QUALIFIED_WINDOW_SIZE,
-				competitionWindowSize,
-				cursorBeforeMod,
-				cursorAfterMod,
-				startIndex,
-			};
 		}
 
 		const counts = {
@@ -703,7 +730,7 @@ export class AssignmentEngine {
 				chunk_end: chunkEnd,
 				total_chunks: sliceSize,
 				chunk_size: input.chunkSize,
-				gateway_url: orchestrator.gatewayUrl ?? DEFAULT_WORKER_GATEWAY_BASE_URL,
+				gateway_url: orchestrator.gateway_url ?? DEFAULT_WORKER_GATEWAY_BASE_URL,
 				destination_url: extractDestinationUrl(input.metadata),
 			});
 
@@ -742,12 +769,12 @@ export class AssignmentEngine {
 		const stale = await this.db<
 			{
 				id: string;
-				transferId: string;
-				orchestratorId: string;
-				chunkStart: number;
-				chunkEnd: number;
-				totalChunks: number;
-				chunkSize: number;
+				transfer_id: string;
+				orchestrator_id: string;
+				chunk_start: number;
+				chunk_end: number;
+				total_chunks: number;
+				chunk_size: number;
 				metadata: unknown;
 			}[]
 		>`
@@ -775,11 +802,11 @@ export class AssignmentEngine {
 
 			await persistAssignmentFailure(this.db, {
 				assignmentId: assignment.id,
-				transferId: assignment.transferId,
-				orchestratorId: assignment.orchestratorId,
-				chunkStart: assignment.chunkStart,
-				chunkEnd: assignment.chunkEnd,
-				totalChunks: assignment.totalChunks,
+				transferId: assignment.transfer_id,
+				orchestratorId: assignment.orchestrator_id,
+				chunkStart: assignment.chunk_start,
+				chunkEnd: assignment.chunk_end,
+				totalChunks: assignment.total_chunks,
 				failureType: "stale_assignment_timeout",
 				reason: "assignment_produced_no_tasks_before_timeout",
 			});
@@ -805,14 +832,14 @@ export class AssignmentEngine {
 				let selection: SelectionResult;
 				try {
 					if (testMode) {
-						selection = await this.selectOrchestrators(sql, true, [assignment.orchestratorId], assignment.transferId);
+						selection = await this.selectOrchestrators(sql, true, [assignment.orchestrator_id], assignment.transfer_id);
 					} else if (lockedRingCursor !== undefined) {
 						selection = await this.selectOrchestrators(
 							sql,
 							false,
-							[assignment.orchestratorId],
-							assignment.transferId,
-							assignment.totalChunks,
+							[assignment.orchestrator_id],
+							assignment.transfer_id,
+							assignment.total_chunks,
 							lockedRingCursor,
 						);
 					} else {
@@ -825,10 +852,10 @@ export class AssignmentEngine {
 
 				const redistributed = await this.assignChunkCoverage({
 					sql,
-					transferId: assignment.transferId,
-					chunkStart: assignment.chunkStart,
-					totalChunks: assignment.totalChunks,
-					chunkSize: assignment.chunkSize,
+					transferId: assignment.transfer_id,
+					chunkStart: assignment.chunk_start,
+					totalChunks: assignment.total_chunks,
+					chunkSize: assignment.chunk_size,
 					metadata: meta,
 					orchestrators: selection.orchestrators,
 					selectionRule: selection.selectionRule,
@@ -870,10 +897,10 @@ export class AssignmentEngine {
 
 			try {
 				await beginFn.call(this.db, async (sql: SqlTag) => {
-					const [ringRow] = await sql<{ qualifiedRingCursor: string }[]>`
+					const [ringRow] = await sql<{ qualified_ring_cursor: string }[]>`
 						SELECT qualified_ring_cursor FROM core.qualified_assignment_ring WHERE singleton = TRUE FOR UPDATE
 					`;
-					const lockedCursor = BigInt(ringRow?.qualifiedRingCursor ?? "0");
+					const lockedCursor = BigInt(ringRow?.qualified_ring_cursor ?? "0");
 
 					const outcome = await tryRedistributeSql(sql, lockedCursor);
 					if (!outcome.ok) {
@@ -885,7 +912,7 @@ export class AssignmentEngine {
 						const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
 						await sql`
 							UPDATE core.qualified_assignment_ring
-							SET qualified_ring_cursor = ${nextStored}
+							SET qualified_ring_cursor = ${Number(nextStored)}
 							WHERE singleton = TRUE
 						`;
 					}
@@ -916,8 +943,8 @@ export class AssignmentEngine {
 		const transfers = await this.db<
 			{
 				id: string;
-				totalChunks: number;
-				chunkSize: number;
+				total_chunks: number;
+				chunk_size: number;
 				metadata: unknown;
 			}[]
 		>`
@@ -934,47 +961,46 @@ export class AssignmentEngine {
 		const logicalTotalChunks =
 			metadata?.transfer_version === "signed_url_v1" && typeof metadata.logical_chunk_count === "number"
 				? metadata.logical_chunk_count
-				: transfer.totalChunks;
+				: transfer.total_chunks;
 
-		if (testMode) {
-			const selection = await this.selectOrchestrators(this.db, testMode, [], transferId);
-			assertRequiredPoolSelection(selection, testMode);
+		try {
+			if (testMode) {
+				const selection = await this.selectOrchestrators(this.db, testMode, [], transferId);
+				assertRequiredPoolSelection(selection, testMode);
 
-			const coverage = await this.assignChunkCoverage({
-				sql: this.db,
-				transferId,
-				chunkStart: 0,
-				totalChunks: logicalTotalChunks,
-				chunkSize: transfer.chunkSize,
-				metadata,
-				orchestrators: selection.orchestrators,
-				selectionRule: selection.selectionRule,
-			});
+				const coverage = await this.assignChunkCoverage({
+					sql: this.db,
+					transferId,
+					chunkStart: 0,
+					totalChunks: logicalTotalChunks,
+					chunkSize: transfer.chunk_size,
+					metadata,
+					orchestrators: selection.orchestrators,
+					selectionRule: selection.selectionRule,
+				});
 
-			if (!coverage.coveredAllChunks) {
-				if (coverage.assignmentIds.length > 0) {
-					await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${coverage.assignmentIds})`;
+				if (!coverage.coveredAllChunks) {
+					if (coverage.assignmentIds.length > 0) {
+						await this.db`DELETE FROM core.transfer_assignments WHERE id = ANY(${coverage.assignmentIds})`;
+					}
+					throw new Error(COVERAGE_FAILURE_MESSAGE);
 				}
-				throw new Error(
-					"transfer assignment failed because not all chunks could be assigned to live orchestrators",
-				);
+
+				await this.db`
+					UPDATE core.transfers
+					SET status = 'in_progress', started_at = NOW()
+					WHERE id = ${transferId}
+				`;
+
+				return coverage.assignmentIds;
 			}
 
-			await this.db`
-				UPDATE core.transfers
-				SET status = 'in_progress', started_at = NOW()
-				WHERE id = ${transferId}
-			`;
-
-			return coverage.assignmentIds;
-		}
-
-		const beginFn = this.db.begin;
-		if (!beginFn) {
-			throw new Error(
-				"AssignmentEngine: db.begin(...) is required for qualified-pool transfer assignment",
-			);
-		}
+			const beginFn = this.db.begin;
+			if (!beginFn) {
+				throw new Error(
+					"AssignmentEngine: db.begin(...) is required for qualified-pool transfer assignment",
+				);
+			}
 
 		type CapturedAssign = {
 			assignmentIds: string[];
@@ -982,12 +1008,12 @@ export class AssignmentEngine {
 		};
 		let captured: CapturedAssign | null = null;
 
-		try {
-			await beginFn.call(this.db, async (sql: SqlTag) => {
-				const [ringRow] = await sql<{ qualifiedRingCursor: string }[]>`
-					SELECT qualified_ring_cursor FROM core.qualified_assignment_ring WHERE singleton = TRUE FOR UPDATE
-				`;
-				const lockedCursor = BigInt(ringRow?.qualifiedRingCursor ?? "0");
+			try {
+				await beginFn.call(this.db, async (sql: SqlTag) => {
+					const [ringRow] = await sql<{ qualified_ring_cursor: string }[]>`
+						SELECT qualified_ring_cursor FROM core.qualified_assignment_ring WHERE singleton = TRUE FOR UPDATE
+					`;
+					const lockedCursor = BigInt(ringRow?.qualified_ring_cursor ?? "0");
 
 				const selection = await this.selectOrchestrators(
 					sql,
@@ -999,16 +1025,16 @@ export class AssignmentEngine {
 				);
 				assertRequiredPoolSelection(selection, false);
 
-				const coverage = await this.assignChunkCoverage({
-					sql,
-					transferId,
-					chunkStart: 0,
-					totalChunks: logicalTotalChunks,
-					chunkSize: transfer.chunkSize,
-					metadata,
-					orchestrators: selection.orchestrators,
-					selectionRule: selection.selectionRule,
-				});
+					const coverage = await this.assignChunkCoverage({
+						sql,
+						transferId,
+						chunkStart: 0,
+						totalChunks: logicalTotalChunks,
+						chunkSize: transfer.chunk_size,
+						metadata,
+						orchestrators: selection.orchestrators,
+						selectionRule: selection.selectionRule,
+					});
 
 				if (!coverage.coveredAllChunks) {
 					throw new Error("__ASSIGN_COVERAGE_FAIL__");
@@ -1018,12 +1044,12 @@ export class AssignmentEngine {
 				if (!q) {
 					throw new Error("qualified assignment missing qualifiedRing metadata");
 				}
-				const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
-				await sql`
-					UPDATE core.qualified_assignment_ring
-					SET qualified_ring_cursor = ${nextStored}
-					WHERE singleton = TRUE
-				`;
+					const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
+					await sql`
+						UPDATE core.qualified_assignment_ring
+						SET qualified_ring_cursor = ${Number(nextStored)}
+						WHERE singleton = TRUE
+					`;
 
 				await sql`
 					UPDATE core.transfers
@@ -1031,33 +1057,37 @@ export class AssignmentEngine {
 					WHERE id = ${transferId}
 				`;
 
-				captured = { assignmentIds: coverage.assignmentIds, coverage };
-			});
-		} catch (e) {
-			if ((e as Error)?.message === "__ASSIGN_COVERAGE_FAIL__") {
-				throw new Error(
-					"transfer assignment failed because not all chunks could be assigned to live orchestrators",
-				);
+					captured = { assignmentIds: coverage.assignmentIds, coverage };
+				});
+			} catch (e) {
+				if ((e as Error)?.message === "__ASSIGN_COVERAGE_FAIL__") {
+					throw new Error(COVERAGE_FAILURE_MESSAGE);
+				}
+				throw e;
 			}
-			throw e;
-		}
 
-		if (!captured) {
-			throw new Error("assignTransfer qualified path produced no captured result");
-		}
+			if (!captured) {
+				throw new Error("assignTransfer qualified path produced no captured result");
+			}
 
-		return captured.assignmentIds;
+			return captured.assignmentIds;
+		} catch (error) {
+			if (isTerminalAssignmentFailure(error)) {
+				await this.failTransferAssignment(transferId, error.message);
+			}
+			throw error;
+		}
 	}
 
 	async reassignTask(taskId: string, excludeWorkerId?: string): Promise<void> {
-		const tasks = await this.db<{ orchestratorId: string }[]>`
+		const tasks = await this.db<{ orchestrator_id: string }[]>`
       SELECT orchestrator_id AS orchestrator_id FROM core.tasks WHERE id = ${taskId}
     `;
 		const task = tasks[0];
 		if (!task) return;
 
 		const orchs = await this.db<{ hotkey: string }[]>`
-      SELECT hotkey FROM core.orchestrators WHERE id = ${task.orchestratorId} LIMIT 1
+	      SELECT hotkey FROM core.orchestrators WHERE id = ${task.orchestrator_id} LIMIT 1
     `;
 		if (!orchs.length) return;
 

@@ -24,9 +24,11 @@ export interface PrismScoreUpdaterContext {
 
 export type PrismScoreUpdaterJob = (ctx: PrismScoreUpdaterContext) => Promise<void>;
 
-const LOOKBACK_WINDOW = "14 days";
+const EVIDENCE_LOOKBACK_DAYS = 10;
+const LOOKBACK_WINDOW = `${EVIDENCE_LOOKBACK_DAYS} days`;
 const PENALTY_LOOKBACK_WINDOW = "30 days";
 const MATERIALIZE_BATCH_SIZE = 200;
+const TARGET_GRADUATION_VERIFIED_TASKS = 20;
 
 interface OrchestratorRow {
 	id: string;
@@ -38,6 +40,7 @@ interface OrchestratorRow {
 
 interface ProofRow {
 	orchestrator_id: string;
+	task_id: string | null;
 	transfer_id: string | null;
 	bandwidth_mbps: string;
 	event_at: Date;
@@ -245,6 +248,7 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 			db<ProofRow[]>`
         SELECT
 					p.orchestrator_id,
+					p.task_id,
 					t.transfer_id,
 					COALESCE(p.bandwidth_mbps, 0)::TEXT AS bandwidth_mbps,
 					COALESCE(p.verified_at, p.published_at) AS event_at
@@ -325,6 +329,7 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	for (const proof of proofs) {
 		const sample: PrismProofSample = {
 			bandwidthMbps: numberValue(proof.bandwidth_mbps),
+			taskId: proof.task_id,
 			transferId: proof.transfer_id,
 			eventAt: proof.event_at,
 		};
@@ -415,6 +420,10 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 			readiness: {
 				ready: orchestrator.ready,
 				connectedWorkers: orchestrator.connected_workers,
+			},
+			evidenceLookbackDays: EVIDENCE_LOOKBACK_DAYS,
+			confidenceTargets: {
+				targetVerifiedTasks: TARGET_GRADUATION_VERIFIED_TASKS,
 			},
 			registeredAt: orchestrator.registered_at,
 			now,

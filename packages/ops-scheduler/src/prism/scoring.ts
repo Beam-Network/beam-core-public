@@ -1,5 +1,6 @@
 export interface PrismProofSample {
 	bandwidthMbps: number;
+	taskId?: string | null;
 	transferId: string | null;
 	eventAt: Date;
 }
@@ -29,6 +30,10 @@ export interface PrismScoreInput {
 	tasks: PrismTaskSample[];
 	penalties: PrismPenaltySnapshot;
 	readiness: PrismReadinessSnapshot;
+	evidenceLookbackDays?: number;
+	confidenceTargets?: {
+		targetVerifiedTasks?: number;
+	};
 	registeredAt: Date;
 	now: Date;
 }
@@ -49,10 +54,12 @@ export interface PrismScoreResult {
 	scoreComponents: Record<string, unknown>;
 }
 
-const LOOKBACK_DAYS = 14;
+const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 10;
 const PAYMENT_LOOKBACK_DAYS = 30;
 const HALF_LIFE_HOURS = 72;
 const GRADUATION_CONFIDENCE = 0.5;
+const DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS = 20;
+const AGE_SATURATION_DAYS = 21;
 
 function clamp(value: number, min = 0, max = 1): number {
 	return Math.min(max, Math.max(min, value));
@@ -118,33 +125,35 @@ function penaltyMultiplier(snapshot: PrismPenaltySnapshot): { multiplier: number
 }
 
 function confidenceScore(
-	verifiedChunkCount: number,
-	completedTaskCount: number,
+	verifiedTaskCount: number,
 	successRate: number,
+	confidenceTargets: { targetVerifiedTasks: number },
 	registeredAt: Date,
 	now: Date,
 ): {
 	score: number;
 	ageDays: number;
-	chunkRatio: number;
+	verifiedTaskCount: number;
+	verifiedTaskTarget: number;
+	verifiedTaskRatio: number;
 	ageRatio: number;
-	completedTaskCount: number;
-	completedTaskRatio: number;
-	taskEvidenceScore: number;
+	maturityFactor: number;
+	successRate: number;
 } {
+	const verifiedTaskTarget = Math.max(1, confidenceTargets.targetVerifiedTasks);
 	const ageDays = Math.max(0, now.getTime() - registeredAt.getTime()) / (1000 * 60 * 60 * 24);
-	const chunkRatio = clamp(verifiedChunkCount / 25);
-	const ageRatio = clamp(ageDays / LOOKBACK_DAYS);
-	const completedTaskRatio = clamp(completedTaskCount / 20);
-	const taskEvidenceScore = clamp(completedTaskRatio * successRate);
+	const verifiedTaskRatio = clamp(verifiedTaskCount / verifiedTaskTarget);
+	const ageRatio = clamp(ageDays / AGE_SATURATION_DAYS);
+	const maturityFactor = clamp(0.8 + 0.2 * ageRatio);
 	return {
-		score: clamp(chunkRatio * 0.3 + taskEvidenceScore * 0.5 + ageRatio * 0.2),
+		score: clamp(verifiedTaskRatio * successRate * maturityFactor),
 		ageDays,
-		chunkRatio,
+		verifiedTaskCount,
+		verifiedTaskTarget,
+		verifiedTaskRatio,
 		ageRatio,
-		completedTaskCount,
-		completedTaskRatio,
-		taskEvidenceScore,
+		maturityFactor,
+		successRate,
 	};
 }
 
@@ -207,11 +216,18 @@ function reliabilityScore(
 }
 
 export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
+	const evidenceLookbackDays = input.evidenceLookbackDays ?? DEFAULT_EVIDENCE_LOOKBACK_DAYS;
 	const boundedProofs = input.proofs.filter((proof) => {
-		return proof.eventAt.getTime() >= input.now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+		return (
+			proof.eventAt.getTime() >=
+			input.now.getTime() - evidenceLookbackDays * 24 * 60 * 60 * 1000
+		);
 	});
 	const boundedTasks = input.tasks.filter((task) => {
-		return task.eventAt.getTime() >= input.now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+		return (
+			task.eventAt.getTime() >=
+			input.now.getTime() - evidenceLookbackDays * 24 * 60 * 60 * 1000
+		);
 	});
 
 	const throughput = normalizeThroughput(input.averageVerifiedMbps, input.throughputBounds);
@@ -219,19 +235,27 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 	const performanceScore = clamp(throughput.score * 0.55 + reliability.reliability * 0.45);
 	const readiness = readinessMultiplier(input.readiness);
 	const penalty = penaltyMultiplier(input.penalties);
+	const confidenceTargets = {
+		targetVerifiedTasks:
+			input.confidenceTargets?.targetVerifiedTasks ?? DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS,
+	};
 
 	const verifiedTransferCount = new Set(
 		boundedProofs
 			.map((proof) => proof.transferId)
 			.filter((transferId): transferId is string => Boolean(transferId)),
 	).size;
+	const verifiedTaskCount = new Set(
+		boundedProofs
+			.map((proof) => proof.taskId)
+			.filter((taskId): taskId is string => Boolean(taskId)),
+	).size;
 	const verifiedChunkCount = boundedProofs.length;
-	const completedTaskCount = boundedTasks.filter((task) => task.state === "completed").length;
 
 	const confidence = confidenceScore(
-		verifiedChunkCount,
-		completedTaskCount,
+		verifiedTaskCount,
 		reliability.successRate,
+		confidenceTargets,
 		input.registeredAt,
 		input.now,
 	);
@@ -252,7 +276,7 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 		prismPool,
 		successRate: round(reliability.successRate, 4),
 		scoreComponents: {
-			lookbackDays: LOOKBACK_DAYS,
+			lookbackDays: evidenceLookbackDays,
 			paymentLookbackDays: PAYMENT_LOOKBACK_DAYS,
 			halfLifeHours: HALF_LIFE_HOURS,
 			sampleCounts: {
@@ -290,11 +314,13 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 			},
 			confidence: {
 				ageDays: round(confidence.ageDays, 2),
-				chunkRatio: round(confidence.chunkRatio, 4),
+				verifiedTaskCount: confidence.verifiedTaskCount,
+				verifiedTaskTarget: round(confidence.verifiedTaskTarget, 4),
+				verifiedTaskRatio: round(confidence.verifiedTaskRatio, 4),
 				ageRatio: round(confidence.ageRatio, 4),
-				completedTaskCount: confidence.completedTaskCount,
-				completedTaskRatio: round(confidence.completedTaskRatio, 4),
-				taskEvidenceScore: round(confidence.taskEvidenceScore, 4),
+				ageSaturationDays: AGE_SATURATION_DAYS,
+				maturityFactor: round(confidence.maturityFactor, 4),
+				successRate: round(confidence.successRate, 4),
 				score: round(confidence.score, 4),
 				graduationConfidence: GRADUATION_CONFIDENCE,
 			},

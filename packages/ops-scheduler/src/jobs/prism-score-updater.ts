@@ -24,11 +24,11 @@ export interface PrismScoreUpdaterContext {
 
 export type PrismScoreUpdaterJob = (ctx: PrismScoreUpdaterContext) => Promise<void>;
 
-const EVIDENCE_LOOKBACK_DAYS = 10;
+const EVIDENCE_LOOKBACK_DAYS = 7;
 const LOOKBACK_WINDOW = `${EVIDENCE_LOOKBACK_DAYS} days`;
 const PENALTY_LOOKBACK_WINDOW = "30 days";
 const MATERIALIZE_BATCH_SIZE = 200;
-const TARGET_GRADUATION_VERIFIED_TASKS = 20;
+const TARGET_GRADUATION_VERIFIED_TASKS = 160;
 
 interface OrchestratorRow {
 	id: string;

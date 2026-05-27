@@ -1,3 +1,9 @@
+/**
+ * PRISM score computation for orchestrator throughput, reliability, readiness, penalties, and confidence.
+ *
+ * Self-contained transparency copy of the production scoring module in beam-core.
+ */
+
 export interface PrismProofSample {
 	bandwidthMbps: number;
 	taskId?: string | null;
@@ -11,36 +17,52 @@ export interface PrismTaskSample {
 	eventAt: Date;
 }
 
-export interface PrismPenaltySnapshot {
-	failedPopPayments: number;
-	fraudPenaltyEvents: number;
-	sybilViolationEvents: number;
-	guardrailInterventionEvents: number;
+export type PrismPenaltyKind = "pop" | "fraud" | "sybil";
+
+export interface PrismPenaltyEvent {
+	kind: PrismPenaltyKind;
+	eventAt: Date;
+}
+
+export interface PenaltyCoefficients {
+	pop: number;
+	fraud: number;
+	sybil: number;
 }
 
 export interface PrismReadinessSnapshot {
 	ready: boolean;
-	connectedWorkers: number;
+	controlPlaneConnected: boolean;
+}
+
+export interface FleetMetricRange {
+	min: number;
+	max: number;
 }
 
 export interface PrismScoreInput {
 	averageVerifiedMbps: number;
-	throughputBounds: { p25: number; p90: number };
+	throughputRange: FleetMetricRange;
+	reliabilityRange: FleetMetricRange;
 	proofs: PrismProofSample[];
 	tasks: PrismTaskSample[];
-	penalties: PrismPenaltySnapshot;
+	penaltyEvents: PrismPenaltyEvent[];
+	penaltyCoefficients: PenaltyCoefficients;
 	readiness: PrismReadinessSnapshot;
 	evidenceLookbackDays?: number;
 	confidenceTargets?: {
 		targetVerifiedTasks?: number;
+		ageSaturationDays?: number;
 	};
 	registeredAt: Date;
 	now: Date;
+	graduationConfidence?: number;
 }
 
 export interface PrismScoreResult {
 	throughputScore: number;
 	reliabilityScore: number;
+	rawReliability: number;
 	performanceScore: number;
 	readinessMultiplier: number;
 	penaltyMultiplier: number;
@@ -55,11 +77,23 @@ export interface PrismScoreResult {
 }
 
 const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 7;
-const PAYMENT_LOOKBACK_DAYS = 30;
 const HALF_LIFE_HOURS = 72;
-const GRADUATION_CONFIDENCE = 0.5;
-const DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS = 240;
-const AGE_SATURATION_DAYS = 21;
+export const DEFAULT_GRADUATION_CONFIDENCE = 0.9;
+
+export function resolveNewPool(
+	previousPool: "qualifying" | "qualified",
+	confidenceScore: number,
+	graduationConfidence = DEFAULT_GRADUATION_CONFIDENCE,
+): "qualifying" | "qualified" {
+	if (previousPool === "qualified") return "qualified";
+	return confidenceScore >= graduationConfidence ? "qualified" : "qualifying";
+}
+const DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS = 120;
+const DEFAULT_AGE_SATURATION_DAYS = 7;
+const PERFORMANCE_THROUGHPUT_WEIGHT = 0.5;
+const PERFORMANCE_RELIABILITY_WEIGHT = 0.5;
+/** Lowest normalized fleet score for orchestrators with positive evidence (linear spread up to 1). */
+export const FLEET_NORMALIZATION_FLOOR = 0.2;
 
 function clamp(value: number, min = 0, max = 1): number {
 	return Math.min(max, Math.max(min, value));
@@ -69,92 +103,49 @@ function round(value: number, digits = 5): number {
 	return Number(value.toFixed(digits));
 }
 
-export function percentile(values: number[], ratio: number): number {
-	if (!values.length) return 0;
-	const sorted = [...values].sort((left, right) => left - right);
-	const index = (sorted.length - 1) * ratio;
-	const lower = Math.floor(index);
-	const upper = Math.ceil(index);
-	if (lower === upper) return sorted[lower]!;
-	const weight = index - lower;
-	return sorted[lower]! * (1 - weight) + sorted[upper]! * weight;
-}
-
-function sampleWeight(sampleAt: Date, now: Date): number {
+export function sampleWeight(sampleAt: Date, now: Date, halfLifeHours = HALF_LIFE_HOURS): number {
 	const ageMs = Math.max(0, now.getTime() - sampleAt.getTime());
 	const ageHours = ageMs / (1000 * 60 * 60);
-	return Math.pow(0.5, ageHours / HALF_LIFE_HOURS);
+	return Math.pow(0.5, ageHours / halfLifeHours);
 }
 
-function normalizeThroughput(
-	averageVerifiedMbps: number,
-	bounds: { p25: number; p90: number },
+export function normalizeFleetMetric(
+	value: number,
+	range: FleetMetricRange,
 ): { score: number; floor: number; ceiling: number } {
-	const floor = bounds.p25;
-	const ceiling = Math.max(bounds.p90, floor + 1);
-	if (averageVerifiedMbps <= 0) {
+	const floor = range.min;
+	const ceiling = Math.max(range.max, floor + 1e-9);
+	if (value <= 0) {
 		return { score: 0, floor, ceiling };
 	}
-
+	if (ceiling <= floor) {
+		return { score: 1, floor, ceiling };
+	}
+	const linear = (value - floor) / (ceiling - floor);
+	const span = 1 - FLEET_NORMALIZATION_FLOOR;
 	return {
-		score: clamp((averageVerifiedMbps - floor) / (ceiling - floor)),
+		score: clamp(FLEET_NORMALIZATION_FLOOR + span * linear),
 		floor,
 		ceiling,
 	};
 }
 
-function readinessMultiplier(readiness: PrismReadinessSnapshot): { multiplier: number; reason: string } {
-	if (!readiness.ready) return { multiplier: 0, reason: "not_ready" };
-	if (readiness.connectedWorkers <= 0) return { multiplier: 0, reason: "no_connected_workers" };
-	if (readiness.connectedWorkers === 1) return { multiplier: 0.7, reason: "single_worker" };
-	if (readiness.connectedWorkers === 2) return { multiplier: 0.85, reason: "two_workers" };
-	return { multiplier: 1, reason: "fully_ready" };
-}
-
-function penaltyMultiplier(snapshot: PrismPenaltySnapshot): { multiplier: number; pressure: number } {
-	const pressure =
-		snapshot.failedPopPayments * 0.15 +
-		snapshot.fraudPenaltyEvents * 0.1 +
-		snapshot.sybilViolationEvents * 0.1 +
-		snapshot.guardrailInterventionEvents * 0.08;
-
-	return {
-		multiplier: clamp(1 - pressure, 0.2, 1),
-		pressure,
-	};
-}
-
-function confidenceScore(
-	verifiedTaskCount: number,
-	successRate: number,
-	confidenceTargets: { targetVerifiedTasks: number },
-	registeredAt: Date,
+function filterByLookback<T extends { eventAt: Date }>(
+	samples: T[],
 	now: Date,
-): {
-	score: number;
-	ageDays: number;
-	verifiedTaskCount: number;
-	verifiedTaskTarget: number;
-	verifiedTaskRatio: number;
-	ageRatio: number;
-	maturityFactor: number;
-	successRate: number;
-} {
-	const verifiedTaskTarget = Math.max(1, confidenceTargets.targetVerifiedTasks);
-	const ageDays = Math.max(0, now.getTime() - registeredAt.getTime()) / (1000 * 60 * 60 * 24);
-	const verifiedTaskRatio = clamp(verifiedTaskCount / verifiedTaskTarget);
-	const ageRatio = clamp(ageDays / AGE_SATURATION_DAYS);
-	const maturityFactor = clamp(0.8 + 0.2 * ageRatio);
-	return {
-		score: clamp(verifiedTaskRatio * successRate * maturityFactor),
-		ageDays,
-		verifiedTaskCount,
-		verifiedTaskTarget,
-		verifiedTaskRatio,
-		ageRatio,
-		maturityFactor,
-		successRate,
-	};
+	lookbackDays: number,
+): T[] {
+	const cutoff = now.getTime() - lookbackDays * 24 * 60 * 60 * 1000;
+	return samples.filter((sample) => sample.eventAt.getTime() >= cutoff);
+}
+
+export function computeRawReliability(
+	tasks: PrismTaskSample[],
+	now: Date,
+	evidenceLookbackDays = DEFAULT_EVIDENCE_LOOKBACK_DAYS,
+): ReturnType<typeof reliabilityScore> {
+	const boundedTasks = filterByLookback(tasks, now, evidenceLookbackDays);
+	return reliabilityScore(boundedTasks, now);
 }
 
 function reliabilityScore(
@@ -215,29 +206,83 @@ function reliabilityScore(
 	};
 }
 
+function readinessMultiplier(readiness: PrismReadinessSnapshot): { multiplier: number; reason: string } {
+	if (!readiness.controlPlaneConnected) return { multiplier: 0, reason: "disconnected" };
+	if (!readiness.ready) return { multiplier: 0, reason: "not_ready" };
+	return { multiplier: 1, reason: "ready" };
+}
+
+function decayedPenaltyPressure(
+	events: PrismPenaltyEvent[],
+	coefficients: PenaltyCoefficients,
+	now: Date,
+): { multiplier: number; pressure: number; eventCount: number } {
+	let pressure = 0;
+	for (const event of events) {
+		const coeff = coefficients[event.kind];
+		pressure += coeff * sampleWeight(event.eventAt, now);
+	}
+	return {
+		pressure,
+		multiplier: clamp(1 - pressure, 0.2, 1),
+		eventCount: events.length,
+	};
+}
+
+function confidenceScore(
+	verifiedTaskCount: number,
+	successRate: number,
+	confidenceTargets: { targetVerifiedTasks: number; ageSaturationDays: number },
+	registeredAt: Date,
+	now: Date,
+): {
+	score: number;
+	ageDays: number;
+	verifiedTaskCount: number;
+	verifiedTaskTarget: number;
+	verifiedTaskRatio: number;
+	ageRatio: number;
+	maturityFactor: number;
+	successRate: number;
+} {
+	const verifiedTaskTarget = Math.max(1, confidenceTargets.targetVerifiedTasks);
+	const ageSaturationDays = Math.max(1, confidenceTargets.ageSaturationDays);
+	const ageDays = Math.max(0, now.getTime() - registeredAt.getTime()) / (1000 * 60 * 60 * 24);
+	const verifiedTaskRatio = clamp(verifiedTaskCount / verifiedTaskTarget);
+	const ageRatio = clamp(ageDays / ageSaturationDays);
+	const maturityFactor = clamp(0.8 + 0.2 * ageRatio);
+	return {
+		score: clamp(verifiedTaskRatio * successRate * maturityFactor),
+		ageDays,
+		verifiedTaskCount,
+		verifiedTaskTarget,
+		verifiedTaskRatio,
+		ageRatio,
+		maturityFactor,
+		successRate,
+	};
+}
+
 export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 	const evidenceLookbackDays = input.evidenceLookbackDays ?? DEFAULT_EVIDENCE_LOOKBACK_DAYS;
-	const boundedProofs = input.proofs.filter((proof) => {
-		return (
-			proof.eventAt.getTime() >=
-			input.now.getTime() - evidenceLookbackDays * 24 * 60 * 60 * 1000
-		);
-	});
-	const boundedTasks = input.tasks.filter((task) => {
-		return (
-			task.eventAt.getTime() >=
-			input.now.getTime() - evidenceLookbackDays * 24 * 60 * 60 * 1000
-		);
-	});
+	const boundedProofs = filterByLookback(input.proofs, input.now, evidenceLookbackDays);
+	const boundedTasks = filterByLookback(input.tasks, input.now, evidenceLookbackDays);
+	const boundedPenalties = filterByLookback(input.penaltyEvents, input.now, evidenceLookbackDays);
 
-	const throughput = normalizeThroughput(input.averageVerifiedMbps, input.throughputBounds);
+	const throughput = normalizeFleetMetric(input.averageVerifiedMbps, input.throughputRange);
 	const reliability = reliabilityScore(boundedTasks, input.now);
-	const performanceScore = clamp(throughput.score * 0.55 + reliability.reliability * 0.45);
+	const normalizedReliability = normalizeFleetMetric(reliability.reliability, input.reliabilityRange);
+	const performanceScore = clamp(
+		throughput.score * PERFORMANCE_THROUGHPUT_WEIGHT +
+			normalizedReliability.score * PERFORMANCE_RELIABILITY_WEIGHT,
+	);
 	const readiness = readinessMultiplier(input.readiness);
-	const penalty = penaltyMultiplier(input.penalties);
+	const penalty = decayedPenaltyPressure(boundedPenalties, input.penaltyCoefficients, input.now);
 	const confidenceTargets = {
 		targetVerifiedTasks:
 			input.confidenceTargets?.targetVerifiedTasks ?? DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS,
+		ageSaturationDays:
+			input.confidenceTargets?.ageSaturationDays ?? DEFAULT_AGE_SATURATION_DAYS,
 	};
 
 	const verifiedTransferCount = new Set(
@@ -259,12 +304,14 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 		input.registeredAt,
 		input.now,
 	);
-	const prismPool = confidence.score > GRADUATION_CONFIDENCE ? "qualified" : "qualifying";
+	const graduationConfidence = input.graduationConfidence ?? DEFAULT_GRADUATION_CONFIDENCE;
+	const prismPool = resolveNewPool("qualifying", confidence.score, graduationConfidence);
 	const finalScore = clamp(performanceScore * readiness.multiplier * penalty.multiplier);
 
 	return {
 		throughputScore: round(throughput.score),
-		reliabilityScore: round(reliability.reliability),
+		reliabilityScore: round(normalizedReliability.score),
+		rawReliability: round(reliability.reliability),
 		performanceScore: round(performanceScore),
 		readinessMultiplier: round(readiness.multiplier),
 		penaltyMultiplier: round(penalty.multiplier),
@@ -277,15 +324,27 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 		successRate: round(reliability.successRate, 4),
 		scoreComponents: {
 			lookbackDays: evidenceLookbackDays,
-			paymentLookbackDays: PAYMENT_LOOKBACK_DAYS,
 			halfLifeHours: HALF_LIFE_HOURS,
+			performanceWeights: {
+				throughput: PERFORMANCE_THROUGHPUT_WEIGHT,
+				reliability: PERFORMANCE_RELIABILITY_WEIGHT,
+			},
+			fleetNormalization: {
+				floor: FLEET_NORMALIZATION_FLOOR,
+				ceiling: 1,
+			},
 			sampleCounts: {
 				proofsInWindow: boundedProofs.length,
 				tasksInWindow: boundedTasks.length,
+				penaltyEventsInWindow: boundedPenalties.length,
 			},
-			throughputBounds: {
-				p25: round(input.throughputBounds.p25, 2),
-				p90: round(input.throughputBounds.p90, 2),
+			throughputRange: {
+				min: round(input.throughputRange.min, 2),
+				max: round(input.throughputRange.max, 2),
+			},
+			reliabilityRange: {
+				min: round(input.reliabilityRange.min, 4),
+				max: round(input.reliabilityRange.max, 4),
 			},
 			throughput: {
 				averageVerifiedMbps: round(input.averageVerifiedMbps, 2),
@@ -294,21 +353,24 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 				ceiling: round(throughput.ceiling, 2),
 			},
 			reliability: {
+				rawReliability: round(reliability.reliability),
+				normalizedScore: round(normalizedReliability.score),
 				completedWeight: round(reliability.completedWeight),
 				failedWeight: round(reliability.failedWeight),
 				reassignmentWeight: round(reliability.reassignmentWeight),
 				totalWeight: round(reliability.totalWeight),
 				reassignmentRate: round(reliability.reassignmentRate, 4),
 				successRate: round(reliability.successRate, 4),
-				reliabilityScore: round(reliability.reliability),
 			},
 			penalties: {
-				...input.penalties,
+				coefficients: { ...input.penaltyCoefficients },
+				eventCount: penalty.eventCount,
 				pressure: round(penalty.pressure),
 				multiplier: round(penalty.multiplier),
 			},
 			readiness: {
-				...input.readiness,
+				ready: input.readiness.ready,
+				controlPlaneConnected: input.readiness.controlPlaneConnected,
 				multiplier: round(readiness.multiplier),
 				reason: readiness.reason,
 			},
@@ -318,11 +380,11 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 				verifiedTaskTarget: round(confidence.verifiedTaskTarget, 4),
 				verifiedTaskRatio: round(confidence.verifiedTaskRatio, 4),
 				ageRatio: round(confidence.ageRatio, 4),
-				ageSaturationDays: AGE_SATURATION_DAYS,
+				ageSaturationDays: confidenceTargets.ageSaturationDays,
 				maturityFactor: round(confidence.maturityFactor, 4),
 				successRate: round(confidence.successRate, 4),
 				score: round(confidence.score, 4),
-				graduationConfidence: GRADUATION_CONFIDENCE,
+				graduationConfidence,
 			},
 			final: {
 				performanceScore: round(performanceScore),

@@ -40,6 +40,11 @@ export interface FleetMetricRange {
 	max: number;
 }
 
+export interface PerformanceWeights {
+	throughput: number;
+	reliability: number;
+}
+
 export interface PrismScoreInput {
 	averageVerifiedMbps: number;
 	throughputRange: FleetMetricRange;
@@ -57,6 +62,7 @@ export interface PrismScoreInput {
 	registeredAt: Date;
 	now: Date;
 	graduationConfidence?: number;
+	performanceWeights?: PerformanceWeights;
 }
 
 export interface PrismScoreResult {
@@ -90,8 +96,8 @@ export function resolveNewPool(
 }
 const DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS = 120;
 const DEFAULT_AGE_SATURATION_DAYS = 7;
-const PERFORMANCE_THROUGHPUT_WEIGHT = 0.5;
-const PERFORMANCE_RELIABILITY_WEIGHT = 0.5;
+export const DEFAULT_PERFORMANCE_THROUGHPUT_WEIGHT = 0.4;
+export const DEFAULT_PERFORMANCE_RELIABILITY_WEIGHT = 0.6;
 /** Lowest normalized fleet score for orchestrators with positive evidence (linear spread up to 1). */
 export const FLEET_NORMALIZATION_FLOOR = 0.2;
 
@@ -263,18 +269,26 @@ function confidenceScore(
 	};
 }
 
+function resolvePerformanceWeights(input: PrismScoreInput): PerformanceWeights {
+	return {
+		throughput: input.performanceWeights?.throughput ?? DEFAULT_PERFORMANCE_THROUGHPUT_WEIGHT,
+		reliability: input.performanceWeights?.reliability ?? DEFAULT_PERFORMANCE_RELIABILITY_WEIGHT,
+	};
+}
+
 export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 	const evidenceLookbackDays = input.evidenceLookbackDays ?? DEFAULT_EVIDENCE_LOOKBACK_DAYS;
 	const boundedProofs = filterByLookback(input.proofs, input.now, evidenceLookbackDays);
 	const boundedTasks = filterByLookback(input.tasks, input.now, evidenceLookbackDays);
 	const boundedPenalties = filterByLookback(input.penaltyEvents, input.now, evidenceLookbackDays);
+	const performanceWeights = resolvePerformanceWeights(input);
 
 	const throughput = normalizeFleetMetric(input.averageVerifiedMbps, input.throughputRange);
 	const reliability = reliabilityScore(boundedTasks, input.now);
 	const normalizedReliability = normalizeFleetMetric(reliability.reliability, input.reliabilityRange);
 	const performanceScore = clamp(
-		throughput.score * PERFORMANCE_THROUGHPUT_WEIGHT +
-			normalizedReliability.score * PERFORMANCE_RELIABILITY_WEIGHT,
+		throughput.score * performanceWeights.throughput +
+			normalizedReliability.score * performanceWeights.reliability,
 	);
 	const readiness = readinessMultiplier(input.readiness);
 	const penalty = decayedPenaltyPressure(boundedPenalties, input.penaltyCoefficients, input.now);
@@ -326,8 +340,8 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 			lookbackDays: evidenceLookbackDays,
 			halfLifeHours: HALF_LIFE_HOURS,
 			performanceWeights: {
-				throughput: PERFORMANCE_THROUGHPUT_WEIGHT,
-				reliability: PERFORMANCE_RELIABILITY_WEIGHT,
+				throughput: performanceWeights.throughput,
+				reliability: performanceWeights.reliability,
 			},
 			fleetNormalization: {
 				floor: FLEET_NORMALIZATION_FLOOR,

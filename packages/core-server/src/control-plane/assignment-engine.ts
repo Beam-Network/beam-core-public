@@ -14,7 +14,7 @@ interface OrchestratorWebSocket {
 
 const CONTROL_PLANE_PUBLIC_GATEWAY_URL = "http://localhost:8001";
 const DEFAULT_WORKER_GATEWAY_BASE_URL = CONTROL_PLANE_PUBLIC_GATEWAY_URL;
-const STALE_ASSIGNMENT_TIMEOUT_SECONDS = 16;
+const ZERO_TASK_ASSIGNMENT_TIMEOUT_SECONDS = 5;
 const TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS = 15;
 const QUALIFIED_WINDOW_RATIO = 0.6;
 const MIN_QUALIFIED_WINDOW_SIZE = 10;
@@ -1680,7 +1680,7 @@ export class AssignmentEngine {
       FROM core.transfer_assignments ta
       JOIN core.transfers t ON t.id = ta.transfer_id
       WHERE ta.status = 'assigned'
-			AND ta.assigned_at < NOW() - (${STALE_ASSIGNMENT_TIMEOUT_SECONDS} * INTERVAL '1 second')
+			AND ta.assigned_at < NOW() - (${ZERO_TASK_ASSIGNMENT_TIMEOUT_SECONDS} * INTERVAL '1 second')
         AND NOT EXISTS (
           SELECT 1 FROM core.tasks tk WHERE tk.assignment_id = ta.id
         )

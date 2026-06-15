@@ -12,8 +12,6 @@ interface OrchestratorWebSocket {
 	send(data: string): void;
 }
 
-const CONTROL_PLANE_PUBLIC_GATEWAY_URL = "http://localhost:8001";
-const DEFAULT_WORKER_GATEWAY_BASE_URL = CONTROL_PLANE_PUBLIC_GATEWAY_URL;
 const ZERO_TASK_ASSIGNMENT_TIMEOUT_SECONDS = 5;
 const TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS = 15;
 const QUALIFIED_WINDOW_RATIO = 0.6;
@@ -124,22 +122,17 @@ function normalizeGatewayUrl(url: string | null | undefined): string | null {
 	return trimmed.replace(/\/+$/, "");
 }
 
-function configuredPublicWorkerGatewayUrl(): string {
-	return normalizeGatewayUrl(CONTROL_PLANE_PUBLIC_GATEWAY_URL) ?? CONTROL_PLANE_PUBLIC_GATEWAY_URL;
-}
-
 function workerGatewayUrlForType(
 	type: string | null | undefined,
 	url: string | null | undefined,
 	fallbackUrl?: string | null | undefined,
 ): string | null {
-	if (type === "public_worker") return configuredPublicWorkerGatewayUrl();
 	return url ?? fallbackUrl ?? null;
 }
 
 export interface SessionSummary {
 	workerId: string;
-	gatewayMode: "public" | "orch_owned";
+	gatewayMode: "orch_owned";
 	gatewayUrl: string | null;
 	orchestratorId: string | null;
 }
@@ -1311,8 +1304,7 @@ export class AssignmentEngine {
 					total_chunks: push.totalChunks,
 					chunk_size: push.chunkSize,
 					gateway_url:
-						workerGatewayUrlForType(push.orchestrator.gateway_type, push.orchestrator.gateway_url) ??
-						configuredPublicWorkerGatewayUrl(),
+						workerGatewayUrlForType(push.orchestrator.gateway_type, push.orchestrator.gateway_url),
 					destination_url: destinationUrl,
 				});
 				if (pushed) return;

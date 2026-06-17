@@ -8,11 +8,22 @@
 import {
 	computePrismScore,
 	resolveNewPool,
+	withRoutingOverride,
+	type FleetMetricRange,
 	type PenaltyCoefficients,
-	type PrismPenaltyEvent,
-	type PrismProofSample,
-	type PrismTaskSample,
+	type PerformanceWeights,
+	type PrismPenaltyHourBucket,
+	type PrismScoreInput,
 	type PrismScoreResult,
+	type PrismTaskHourBucket,
+	computeRawReliability,
+	hourMidpoint,
+	sampleWeight,
+	DEFAULT_GRADUATION_CONFIDENCE,
+	DEFAULT_PERFORMANCE_RELIABILITY_WEIGHT,
+	DEFAULT_PERFORMANCE_THROUGHPUT_WEIGHT,
+	FLEET_NORMALIZATION_FLOOR,
+	HALF_LIFE_HOURS,
 } from "../prism/scoring.js";
 
 export type DbClient = <T = unknown>(
@@ -26,225 +37,144 @@ export interface PrismScoreUpdaterContext {
 
 export type PrismScoreUpdaterJob = (ctx: PrismScoreUpdaterContext) => Promise<void>;
 
-const PRISM_EVIDENCE_LOOKBACK_DAYS = 7;
-const LOOKBACK_WINDOW = `${PRISM_EVIDENCE_LOOKBACK_DAYS} days`;
-const PRISM_TARGET_GRADUATION_VERIFIED_TASKS = 120;
-const PRISM_AGE_SATURATION_DAYS = 7;
-const PRISM_PENALTY_COEFF_POP = 0.05;
-const PRISM_PENALTY_COEFF_FRAUD = 0.05;
-const PRISM_PENALTY_COEFF_SYBIL = 0.05;
-const PRISM_GRADUATION_CONFIDENCE = 0.9;
-const PRISM_POOL_TRANSITION_SCORE = 0.5;
+type Db = DbClient;
 
-const penaltyCoefficients: PenaltyCoefficients = {
-	pop: PRISM_PENALTY_COEFF_POP,
-	fraud: PRISM_PENALTY_COEFF_FRAUD,
-	sybil: PRISM_PENALTY_COEFF_SYBIL,
+const logger = {
+	info(_data: unknown, _message?: string): void {},
+	debug(_data: unknown, _message?: string): void {},
+	warn(_data: unknown, _message?: string): void {},
 };
 
-function routingScoreForOrchestrator(
-	orchestrator: OrchestratorPrismRow,
-	computedFinalScore: number,
-): number {
-	if (orchestrator.prism_pool_transition_pending) return PRISM_POOL_TRANSITION_SCORE;
-	return computedFinalScore;
+const OPS_SCHEDULER_DEFAULT_CORE_SERVER_URL = "http://localhost:8000";
+
+async function postRoutingSync(path: string, body: unknown): Promise<void> {
+	const secret = process.env.GATEWAY_INTERNAL_SECRET;
+	if (!secret) {
+		logger.debug({ path }, "skipping control-plane routing sync because GATEWAY_INTERNAL_SECRET is unset");
+		return;
+	}
+
+	const coreServerUrl = process.env.CORE_SERVER_URL ?? OPS_SCHEDULER_DEFAULT_CORE_SERVER_URL;
+	const url = `${coreServerUrl.replace(/\/$/, "")}${path}`;
+	const response = await fetch(url, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-internal-secret": secret,
+		},
+		body: JSON.stringify(body),
+	});
+	if (!response.ok) {
+		const text = await response.text().catch(() => "");
+		throw new Error(`control-plane routing sync ${path} failed: ${response.status} ${text}`);
+	}
 }
 
-const BATCH_SIZE = 200;
-
-interface ChainStateRow {
-	current_epoch: number | null;
-}
-
-export async function materializePopPenaltyEvents(args: {
-	db: DbClient;
-	currentEpoch?: number | null;
-}): Promise<number> {
-	const { db } = args;
-	const currentEpoch =
-		args.currentEpoch ??
-		(
-			await db<ChainStateRow[]>`
-				SELECT current_epoch
-				FROM core.chain_state
-				ORDER BY last_synced_at DESC
-				LIMIT 1
-			`
-		)[0]?.current_epoch ??
-		null;
-
-	if (currentEpoch == null || currentEpoch <= 0) return 0;
-
-	const insertedRows = await db<{ worker_payment_id: string }[]>`
-		WITH pending_events AS (
-			SELECT
-				wp.id AS worker_payment_id,
-				wp.orchestrator_id,
-				wp.worker_id,
-				wp.task_id,
-				wp.tx_hash,
-				wp.epoch AS payment_epoch,
-				wp.created_at AS payment_recorded_at,
-				COALESCE(wp.pop_verified_at, wp.updated_at, wp.created_at) AS resolved_at,
-				wp.pop_error AS verifier_error
-			FROM core.worker_payments wp
-			WHERE wp.pop_verified = FALSE
-				AND wp.task_id IS NOT NULL
-				AND wp.epoch < ${currentEpoch}
-				AND NOT EXISTS (
-					SELECT 1
-					FROM core.pop_penalty_events ppe
-					WHERE ppe.worker_payment_id = wp.id
-				)
-			ORDER BY COALESCE(wp.pop_verified_at, wp.updated_at, wp.created_at) ASC
-			LIMIT ${BATCH_SIZE}
-		)
-		INSERT INTO core.pop_penalty_events
-			(worker_payment_id, orchestrator_id, worker_id, task_id, tx_hash,
-			 payment_epoch, payment_recorded_at, resolved_at, applied_in_epoch, verifier_error)
-		SELECT
-			worker_payment_id,
-			orchestrator_id,
-			worker_id,
-			task_id,
-			tx_hash,
-			payment_epoch,
-			payment_recorded_at,
-			resolved_at,
-			${currentEpoch},
-			verifier_error
-		FROM pending_events
-		ON CONFLICT (worker_payment_id) DO NOTHING
-		RETURNING worker_payment_id
-	`;
-
-	return insertedRows.length;
-}
-
-
-
+const PRISM_DEFAULTS = {
+	PRISM_EVIDENCE_LOOKBACK_DAYS: 7,
+	PRISM_TARGET_GRADUATION_VERIFIED_TASKS: 120,
+	PRISM_AGE_SATURATION_DAYS: 7,
+	PRISM_PENALTY_COEFF_POP: 0.05,
+	PRISM_PENALTY_COEFF_FRAUD: 0.05,
+	PRISM_PENALTY_COEFF_SYBIL: 0.05,
+	PRISM_GRADUATION_CONFIDENCE: 0.9,
+	PRISM_POOL_TRANSITION_SCORE: 0.5,
+	PRISM_PERFORMANCE_THROUGHPUT_WEIGHT: 0.4,
+	PRISM_PERFORMANCE_RELIABILITY_WEIGHT: 0.6,
+};
 export type PrismEvidencePool = "qualifying" | "qualified";
 
-const TEST_MODE_SQL = `COALESCE((tr.metadata->>'test_mode')::boolean, false)`;
-
-function testModeMatches(pool: PrismEvidencePool): boolean {
-	return pool === "qualifying";
-}
-
-export interface PrismProofRow {
+export interface PrismHourAgg {
 	orchestrator_id: string;
-	task_id: string | null;
-	transfer_id: string | null;
-	bandwidth_mbps: string;
-	event_at: Date;
+	bucket_start: Date;
+	// assignment-derived bandwidth samples
+	bandwidth_sample_count: number;
+	bandwidth_mbps_sum: number;
+	// proof-derived counts
+	verified_task_count: number;
+	verified_transfer_count: number;
+	first_proof_at: Date | null;
+	last_proof_at: Date | null;
+	// task outcomes
+	failed_task_count: number;
+	overseer_intervention_count: number;
+	// penalties
+	pop_penalty_count: number;
+	fraud_penalty_count: number;
+	sybil_penalty_count: number;
 }
 
-export interface PrismTaskRow {
+export interface PrismEvidenceTotals {
 	orchestrator_id: string;
-	state: "completed" | "failed";
-	failure_reason: string | null;
-	event_at: Date;
+	lifetime_verified_task_count: number;
+	lifetime_verified_transfer_count: number;
+	last_aggregated_event_at: Date | null;
 }
 
-export interface PrismPenaltyRow {
-	orchestrator_id: string;
-	kind: "pop" | "fraud" | "sybil";
-	event_at: Date;
-}
-
-export async function loadPrismProofs(
-	db: DbClient,
-	lookbackWindow: string,
+export async function loadPrismHourlyAggregates(
+	db: Db,
+	lookbackDays: number,
 	pool: PrismEvidencePool,
-): Promise<PrismProofRow[]> {
-	const testMode = testModeMatches(pool);
-	return db<PrismProofRow[]>`
+): Promise<PrismHourAgg[]> {
+	return db<PrismHourAgg[]>`
 		SELECT
-			p.orchestrator_id,
-			p.task_id,
-			t.transfer_id,
-			COALESCE(p.bandwidth_mbps, 0)::TEXT AS bandwidth_mbps,
-			COALESCE(p.verified_at, p.published_at) AS event_at
-		FROM core.proofs_of_bandwidth p
-		LEFT JOIN core.tasks t ON t.id = p.task_id
-		LEFT JOIN core.transfers tr ON tr.id = t.transfer_id
-		WHERE COALESCE(p.verified_at, p.published_at) > NOW() - ${lookbackWindow}::INTERVAL
-			AND (p.verification_passed = TRUE OR p.status = 'verified')
-			AND t.transfer_id IS NOT NULL
-			AND COALESCE((tr.metadata->>'test_mode')::boolean, false) = ${testMode}
+			orchestrator_id,
+			bucket_start,
+			bandwidth_sample_count::int,
+			bandwidth_mbps_sum::float8 AS bandwidth_mbps_sum,
+			verified_task_count::int,
+			verified_transfer_count::int,
+			first_proof_at,
+			last_proof_at,
+			failed_task_count::int,
+			overseer_intervention_count::int,
+			pop_penalty_count::int,
+			fraud_penalty_count::int,
+			sybil_penalty_count::int
+		FROM core.prism_evidence_hourly
+		WHERE pool = ${pool}
+		  AND bucket_start >= (
+			date_trunc('hour', (NOW() - (${lookbackDays}::INT * INTERVAL '1 day')) AT TIME ZONE 'UTC')
+			AT TIME ZONE 'UTC'
+		  )
 	`;
 }
 
-export async function loadPrismTasks(
-	db: DbClient,
-	lookbackWindow: string,
+export async function loadPrismEvidenceTotals(
+	db: Db,
 	pool: PrismEvidencePool,
-): Promise<PrismTaskRow[]> {
-	const testMode = testModeMatches(pool);
-	return db<PrismTaskRow[]>`
-		SELECT t.orchestrator_id, t.state, t.failure_reason,
-			COALESCE(t.completed_at, t.failed_at, t.created_at) AS event_at
-		FROM core.tasks t
-		INNER JOIN core.transfers tr ON tr.id = t.transfer_id
-		WHERE COALESCE(t.completed_at, t.failed_at, t.created_at) > NOW() - ${lookbackWindow}::INTERVAL
-			AND t.state IN ('completed', 'failed')
-			AND COALESCE((tr.metadata->>'test_mode')::boolean, false) = ${testMode}
-		UNION ALL
-		SELECT gi.orchestrator_id, 'failed' AS state,
-			CONCAT(COALESCE(gi.intervention_type, 'beamcore_guardrail_reassign'), ':', COALESCE(gi.reason, gi.outcome)) AS failure_reason,
-			gi.intervened_at AS event_at
-		FROM core.orchestrator_guardrail_interventions gi
-		INNER JOIN core.transfers tr ON tr.id = gi.transfer_id
-		WHERE gi.intervened_at > NOW() - ${lookbackWindow}::INTERVAL
-			AND intervention_type = 'beamcore_guardrail_reassign'
-			AND COALESCE((tr.metadata->>'test_mode')::boolean, false) = ${testMode}
-		UNION ALL
-		SELECT af.orchestrator_id, 'failed' AS state,
-			CONCAT('assignment_failure:', COALESCE(af.failure_type, 'unknown'), ':', COALESCE(af.reason, 'unknown')) AS failure_reason,
-			af.created_at AS event_at
-		FROM core.orchestrator_assignment_failures af
-		INNER JOIN core.transfers tr ON tr.id = af.transfer_id
-		WHERE af.created_at > NOW() - ${lookbackWindow}::INTERVAL
-			AND COALESCE((tr.metadata->>'test_mode')::boolean, false) = ${testMode}
+): Promise<PrismEvidenceTotals[]> {
+	return db<PrismEvidenceTotals[]>`
+		SELECT
+			orchestrator_id,
+			lifetime_verified_task_count::int,
+			lifetime_verified_transfer_count::int,
+			last_aggregated_event_at
+		FROM core.prism_evidence_totals
+		WHERE pool = ${pool}
 	`;
 }
 
-export async function loadPrismPenaltyEvents(
-	db: DbClient,
-	currentEpoch: number,
-	lookbackWindow: string,
-	pool: PrismEvidencePool,
-): Promise<PrismPenaltyRow[]> {
-	const testMode = testModeMatches(pool);
-	const transferScoped = db<PrismPenaltyRow[]>`
-		SELECT ppe.orchestrator_id, 'pop'::text AS kind, ppe.resolved_at AS event_at
-		FROM core.pop_penalty_events ppe
-		INNER JOIN core.tasks t ON t.id = ppe.task_id
-		INNER JOIN core.transfers tr ON tr.id = t.transfer_id
-		WHERE ppe.applied_in_epoch <= ${currentEpoch}
-			AND ppe.resolved_at > NOW() - ${lookbackWindow}::INTERVAL
-			AND ppe.task_id IS NOT NULL
-			AND COALESCE((tr.metadata->>'test_mode')::boolean, false) = ${testMode}
-		UNION ALL
-		SELECT t.orchestrator_id, 'sybil'::text AS kind, t.created_at AS event_at
-		FROM core.sybil_violations sv
-		JOIN core.tasks t ON t.assigned_worker_id = sv.worker_id
-		INNER JOIN core.transfers tr ON tr.id = t.transfer_id
-		WHERE sv.resolved_at IS NULL
-			AND t.created_at > NOW() - ${lookbackWindow}::INTERVAL
-			AND t.orchestrator_id IS NOT NULL
-			AND COALESCE((tr.metadata->>'test_mode')::boolean, false) = ${testMode}
-	`;
-	const fraud = db<PrismPenaltyRow[]>`
-		SELECT orchestrator_id, 'fraud'::text AS kind, applied_at AS event_at
-		FROM core.fraud_penalties
-		WHERE orchestrator_id IS NOT NULL
-			AND applied_at > NOW() - ${lookbackWindow}::INTERVAL
-	`;
-	const [scoped, fraudRows] = await Promise.all([transferScoped, fraud]);
-	return [...scoped, ...fraudRows];
+/** Convert PrismHourAgg rows into the hourly bucket types consumed by scoring. */
+export function toPrismTaskHourBuckets(agg: PrismHourAgg): PrismTaskHourBucket {
+	return {
+		bucketStart: agg.bucket_start,
+		verified_task_count: agg.verified_task_count,
+		failed_task_count: agg.failed_task_count,
+		overseer_intervention_count: agg.overseer_intervention_count,
+	};
 }
 
+export function toPrismPenaltyHourBuckets(agg: PrismHourAgg): PrismPenaltyHourBucket {
+	return {
+		bucketStart: agg.bucket_start,
+		pop_penalty_count: agg.pop_penalty_count,
+		fraud_penalty_count: agg.fraud_penalty_count,
+		sybil_penalty_count: agg.sybil_penalty_count,
+	};
+}
+
+export const THROUGHPUT_HALF_LIFE_HOURS = 12;
 
 export interface OrchestratorPrismRow {
 	id: string;
@@ -252,10 +182,13 @@ export interface OrchestratorPrismRow {
 	ready: boolean;
 	control_plane_connected: boolean;
 	registered_at: Date;
+	prism_age_at?: Date;
 	prism_pool: "qualifying" | "qualified";
 	prism_confidence_score: string;
+	prism_final_score?: string;
 	prism_pool_transition_pending: boolean;
 }
+
 
 export function numberValue(value: string | number | null | undefined): number {
 	if (typeof value === "number") return Number.isFinite(value) ? value : 0;
@@ -266,110 +199,104 @@ export function numberValue(value: string | number | null | undefined): number {
 	return 0;
 }
 
-function verifiedTaskCountFromScore(score: PrismScoreResult): number {
-	const confidence = score.scoreComponents as { confidence?: { verifiedTaskCount?: number } };
-	const count = confidence.confidence?.verifiedTaskCount;
-	return Number.isFinite(Number(count)) ? Number(count) : 0;
-}
-
-/** Mirrors PRISM verified task count onto core.orchestrators.total_tasks_completed. */
-export async function syncOrchestratorEvidenceTotals(
-	db: DbClient,
-	orchestratorId: string,
-	score: PrismScoreResult,
-): Promise<void> {
-	const verifiedTaskCount = verifiedTaskCountFromScore(score);
-	await db`
-		UPDATE core.orchestrators
-		SET total_tasks_completed = ${verifiedTaskCount},
-			updated_at = NOW()
-		WHERE id = ${orchestratorId}
-	`;
-}
 
 export interface EvidenceIndexes {
-	proofsByOrchestrator: Map<string, PrismProofSample[]>;
-	tasksByOrchestrator: Map<string, PrismTaskSample[]>;
-	penaltiesByOrchestrator: Map<string, PrismPenaltyEvent[]>;
+	taskBucketsByOrchestrator: Map<string, PrismTaskHourBucket[]>;
+	penaltyBucketsByOrchestrator: Map<string, PrismPenaltyHourBucket[]>;
 	averageMbpsByOrchestrator: Map<string, number>;
+	verifiedTaskCountByOrchestrator: Map<string, number>;
+	verifiedTransferCountByOrchestrator: Map<string, number>;
+	lifetimeVerifiedTaskCountByOrchestrator: Map<string, number>;
+	lifetimeVerifiedTransferCountByOrchestrator: Map<string, number>;
 	rawReliabilityByOrchestrator: Map<string, number>;
 }
 
+
 export function indexPrismEvidence(
-	proofs: PrismProofRow[],
-	tasks: PrismTaskRow[],
-	penalties: PrismPenaltyRow[],
+	hourlyAggs: PrismHourAgg[],
+	totals: PrismEvidenceTotals[],
 	now: Date,
-	evidenceLookbackDays: number,
 ): EvidenceIndexes {
-	const proofsByOrchestrator = new Map<string, PrismProofSample[]>();
-	const tasksByOrchestrator = new Map<string, PrismTaskSample[]>();
-	const penaltiesByOrchestrator = new Map<string, PrismPenaltyEvent[]>();
+	const taskBucketsByOrchestrator = new Map<string, PrismTaskHourBucket[]>();
+	const penaltyBucketsByOrchestrator = new Map<string, PrismPenaltyHourBucket[]>();
 	const averageMbpsByOrchestrator = new Map<string, number>();
+	const verifiedTaskCountByOrchestrator = new Map<string, number>();
+	const verifiedTransferCountByOrchestrator = new Map<string, number>();
+	const lifetimeVerifiedTaskCountByOrchestrator = new Map<string, number>();
+	const lifetimeVerifiedTransferCountByOrchestrator = new Map<string, number>();
 	const rawReliabilityByOrchestrator = new Map<string, number>();
 
-	for (const proof of proofs) {
-		const sample: PrismProofSample = {
-			bandwidthMbps: numberValue(proof.bandwidth_mbps),
-			taskId: proof.task_id,
-			transferId: proof.transfer_id,
-			eventAt: proof.event_at,
-		};
-		const existing = proofsByOrchestrator.get(proof.orchestrator_id) ?? [];
-		existing.push(sample);
-		proofsByOrchestrator.set(proof.orchestrator_id, existing);
+	// Aggregate per-orchestrator across all hourly rows.
+	const mbpsSumByOrch = new Map<string, number>();
+	const mbpsSamplesByOrch = new Map<string, number>();
+	const verifiedTasksByOrch = new Map<string, number>();
+	const verifiedTransfersByOrch = new Map<string, number>();
+
+	for (const agg of hourlyAggs) {
+		const id = agg.orchestrator_id;
+
+		// bandwidth
+		const bandwidthWeight = sampleWeight(hourMidpoint(agg.bucket_start), now, THROUGHPUT_HALF_LIFE_HOURS);
+		mbpsSumByOrch.set(id, (mbpsSumByOrch.get(id) ?? 0) + agg.bandwidth_mbps_sum * bandwidthWeight);
+		mbpsSamplesByOrch.set(id, (mbpsSamplesByOrch.get(id) ?? 0) + agg.bandwidth_sample_count * bandwidthWeight);
+
+		// verified counts (sum across buckets; hourly rows already deduplicate within each bucket)
+		verifiedTasksByOrch.set(id, (verifiedTasksByOrch.get(id) ?? 0) + agg.verified_task_count);
+		verifiedTransfersByOrch.set(id, (verifiedTransfersByOrch.get(id) ?? 0) + agg.verified_transfer_count);
+
+		// task hour buckets
+		const taskBuckets = taskBucketsByOrchestrator.get(id) ?? [];
+		taskBuckets.push(toPrismTaskHourBuckets(agg));
+		taskBucketsByOrchestrator.set(id, taskBuckets);
+
+		// penalty hour buckets
+		const penaltyBuckets = penaltyBucketsByOrchestrator.get(id) ?? [];
+		penaltyBuckets.push(toPrismPenaltyHourBuckets(agg));
+		penaltyBucketsByOrchestrator.set(id, penaltyBuckets);
 	}
 
-	for (const [orchestratorId, orchestratorProofs] of proofsByOrchestrator.entries()) {
-		const total = orchestratorProofs.reduce((sum, proof) => sum + proof.bandwidthMbps, 0);
-		averageMbpsByOrchestrator.set(
-			orchestratorId,
-			orchestratorProofs.length ? total / orchestratorProofs.length : 0,
-		);
+	// Compute averages
+	for (const [id, sum] of mbpsSumByOrch) {
+		const samples = mbpsSamplesByOrch.get(id) ?? 0;
+		averageMbpsByOrchestrator.set(id, samples > 0 ? sum / samples : 0);
 	}
 
-	for (const task of tasks) {
-		const sample: PrismTaskSample = {
-			state: task.state,
-			failureReason: task.failure_reason,
-			eventAt: task.event_at,
-		};
-		const existing = tasksByOrchestrator.get(task.orchestrator_id) ?? [];
-		existing.push(sample);
-		tasksByOrchestrator.set(task.orchestrator_id, existing);
+	for (const [id, count] of verifiedTasksByOrch) {
+		verifiedTaskCountByOrchestrator.set(id, count);
+	}
+	for (const [id, count] of verifiedTransfersByOrch) {
+		verifiedTransferCountByOrchestrator.set(id, count);
 	}
 
-	for (const event of penalties) {
-		const sample: PrismPenaltyEvent = { kind: event.kind, eventAt: event.event_at };
-		const existing = penaltiesByOrchestrator.get(event.orchestrator_id) ?? [];
-		existing.push(sample);
-		penaltiesByOrchestrator.set(event.orchestrator_id, existing);
+	// Lifetime counts from totals
+	for (const row of totals) {
+		lifetimeVerifiedTaskCountByOrchestrator.set(row.orchestrator_id, row.lifetime_verified_task_count);
+		lifetimeVerifiedTransferCountByOrchestrator.set(row.orchestrator_id, row.lifetime_verified_transfer_count);
 	}
 
-	for (const orchestratorId of new Set([
-		...proofsByOrchestrator.keys(),
-		...tasksByOrchestrator.keys(),
-	])) {
-		const orchTasks = tasksByOrchestrator.get(orchestratorId) ?? [];
-		rawReliabilityByOrchestrator.set(
-			orchestratorId,
-			computeRawReliability(orchTasks, now, evidenceLookbackDays).reliability,
-		);
+	// Raw reliability per orchestrator
+	for (const [id, buckets] of taskBucketsByOrchestrator) {
+		rawReliabilityByOrchestrator.set(id, computeRawReliability(buckets, now).reliability);
 	}
 
 	return {
-		proofsByOrchestrator,
-		tasksByOrchestrator,
-		penaltiesByOrchestrator,
+		taskBucketsByOrchestrator,
+		penaltyBucketsByOrchestrator,
 		averageMbpsByOrchestrator,
+		verifiedTaskCountByOrchestrator,
+		verifiedTransferCountByOrchestrator,
+		lifetimeVerifiedTaskCountByOrchestrator,
+		lifetimeVerifiedTransferCountByOrchestrator,
 		rawReliabilityByOrchestrator,
 	};
 }
+
 
 function fleetMetricRange(values: number[]): FleetMetricRange {
 	if (!values.length) return { min: 0, max: 0 };
 	return { min: Math.min(...values), max: Math.max(...values) };
 }
+
 
 export function fleetRangeForCohort(
 	orchestratorIds: string[],
@@ -387,79 +314,121 @@ export function fleetRangeForCohort(
 	};
 }
 
+
+function tierAColumns(score: PrismScoreResult) {
+	return {
+		successRate: score.successRate,
+		penaltyEventCount: score.penaltyEventCount,
+		routingOverrideReason: score.routingOverrideReason,
+		routingComputedFinalScore: score.routingComputedFinalScore,
+		routingAppliedScore: score.routingAppliedScore,
+		lifetimeVerifiedTaskCount: score.lifetimeVerifiedTaskCount,
+	};
+}
+
+
 export async function persistQualifyingMetrics(
-	db: DbClient,
+	db: Db,
 	orchestratorId: string,
 	score: PrismScoreResult,
 ): Promise<void> {
+	const tierA = tierAColumns(score);
 	await db`
 		INSERT INTO core.prism_metrics_qualifying
 			(orchestrator_id, confidence_score,
-			 verified_transfer_count, verified_chunk_count, verified_bandwidth_mbps,
+			 verified_transfer_count, verified_task_count, verified_bandwidth_mbps,
 			 throughput_score, reliability_score, performance_score,
 			 readiness_multiplier, penalty_multiplier,
-			 prism_final_score, score_components, computed_at, updated_at)
+			 prism_final_score,
+			 success_rate, penalty_event_count,
+			 routing_override_reason, routing_computed_final_score, routing_applied_score,
+			 lifetime_verified_task_count, age_days,
+			 computed_at, updated_at)
 		VALUES
 			(${orchestratorId}, ${score.confidenceScore},
-			 ${score.verifiedTransferCount}, ${score.verifiedChunkCount}, ${score.verifiedBandwidthMbps},
+			 ${score.verifiedTransferCount}, ${score.verifiedTaskCount}, ${score.verifiedBandwidthMbps},
 			 ${score.throughputScore}, ${score.reliabilityScore}, ${score.performanceScore},
 			 ${score.readinessMultiplier}, ${score.penaltyMultiplier},
-			 ${score.prismFinalScore}, ${JSON.stringify(score.scoreComponents as never)}, NOW(), NOW())
+			 ${score.prismFinalScore},
+			 ${tierA.successRate}, ${tierA.penaltyEventCount},
+			 ${tierA.routingOverrideReason}, ${tierA.routingComputedFinalScore}, ${tierA.routingAppliedScore},
+			 ${tierA.lifetimeVerifiedTaskCount}, ${score.ageDays},
+			 NOW(), NOW())
 		ON CONFLICT (orchestrator_id) DO UPDATE
-			SET confidence_score        = EXCLUDED.confidence_score,
-				verified_transfer_count = EXCLUDED.verified_transfer_count,
-				verified_chunk_count    = EXCLUDED.verified_chunk_count,
-				verified_bandwidth_mbps = EXCLUDED.verified_bandwidth_mbps,
-				throughput_score        = EXCLUDED.throughput_score,
-				reliability_score       = EXCLUDED.reliability_score,
-				performance_score       = EXCLUDED.performance_score,
-				readiness_multiplier    = EXCLUDED.readiness_multiplier,
-				penalty_multiplier      = EXCLUDED.penalty_multiplier,
-				prism_final_score       = EXCLUDED.prism_final_score,
-				score_components        = EXCLUDED.score_components,
-				computed_at             = NOW(),
-				updated_at              = NOW()
+			SET confidence_score               = EXCLUDED.confidence_score,
+				verified_transfer_count        = EXCLUDED.verified_transfer_count,
+				verified_task_count            = EXCLUDED.verified_task_count,
+				verified_bandwidth_mbps          = EXCLUDED.verified_bandwidth_mbps,
+				throughput_score               = EXCLUDED.throughput_score,
+				reliability_score              = EXCLUDED.reliability_score,
+				performance_score              = EXCLUDED.performance_score,
+				readiness_multiplier           = EXCLUDED.readiness_multiplier,
+				penalty_multiplier             = EXCLUDED.penalty_multiplier,
+				prism_final_score              = EXCLUDED.prism_final_score,
+				success_rate                   = EXCLUDED.success_rate,
+				penalty_event_count            = EXCLUDED.penalty_event_count,
+				routing_override_reason        = EXCLUDED.routing_override_reason,
+				routing_computed_final_score   = EXCLUDED.routing_computed_final_score,
+				routing_applied_score          = EXCLUDED.routing_applied_score,
+				lifetime_verified_task_count   = EXCLUDED.lifetime_verified_task_count,
+				age_days                       = EXCLUDED.age_days,
+				computed_at                    = NOW(),
+				updated_at                     = NOW()
 	`;
-	await syncOrchestratorEvidenceTotals(db, orchestratorId, score);
 }
 
+
 export async function persistQualifiedMetrics(
-	db: DbClient,
+	db: Db,
 	orchestratorId: string,
 	score: PrismScoreResult,
 ): Promise<void> {
+	const tierA = tierAColumns(score);
 	await db`
 		INSERT INTO core.prism_metrics_qualified
 			(orchestrator_id,
-			 verified_transfer_count, verified_chunk_count, verified_bandwidth_mbps,
+			 verified_transfer_count, verified_task_count, verified_bandwidth_mbps,
 			 throughput_score, reliability_score, performance_score,
 			 readiness_multiplier, penalty_multiplier,
-			 prism_final_score, score_components, computed_at, updated_at)
+			 prism_final_score,
+			 success_rate, penalty_event_count,
+			 routing_override_reason, routing_computed_final_score, routing_applied_score,
+			 lifetime_verified_task_count,
+			 computed_at, updated_at)
 		VALUES
 			(${orchestratorId},
-			 ${score.verifiedTransferCount}, ${score.verifiedChunkCount}, ${score.verifiedBandwidthMbps},
+			 ${score.verifiedTransferCount}, ${score.verifiedTaskCount}, ${score.verifiedBandwidthMbps},
 			 ${score.throughputScore}, ${score.reliabilityScore}, ${score.performanceScore},
 			 ${score.readinessMultiplier}, ${score.penaltyMultiplier},
-			 ${score.prismFinalScore}, ${JSON.stringify(score.scoreComponents as never)}, NOW(), NOW())
+			 ${score.prismFinalScore},
+			 ${tierA.successRate}, ${tierA.penaltyEventCount},
+			 ${tierA.routingOverrideReason}, ${tierA.routingComputedFinalScore}, ${tierA.routingAppliedScore},
+			 ${tierA.lifetimeVerifiedTaskCount},
+			 NOW(), NOW())
 		ON CONFLICT (orchestrator_id) DO UPDATE
-			SET verified_transfer_count = EXCLUDED.verified_transfer_count,
-				verified_chunk_count    = EXCLUDED.verified_chunk_count,
-				verified_bandwidth_mbps = EXCLUDED.verified_bandwidth_mbps,
-				throughput_score        = EXCLUDED.throughput_score,
-				reliability_score       = EXCLUDED.reliability_score,
-				performance_score       = EXCLUDED.performance_score,
-				readiness_multiplier    = EXCLUDED.readiness_multiplier,
-				penalty_multiplier      = EXCLUDED.penalty_multiplier,
-				prism_final_score       = EXCLUDED.prism_final_score,
-				score_components        = EXCLUDED.score_components,
-				computed_at             = NOW(),
-				updated_at              = NOW()
+			SET verified_transfer_count        = EXCLUDED.verified_transfer_count,
+				verified_task_count            = EXCLUDED.verified_task_count,
+				verified_bandwidth_mbps          = EXCLUDED.verified_bandwidth_mbps,
+				throughput_score               = EXCLUDED.throughput_score,
+				reliability_score              = EXCLUDED.reliability_score,
+				performance_score              = EXCLUDED.performance_score,
+				readiness_multiplier           = EXCLUDED.readiness_multiplier,
+				penalty_multiplier             = EXCLUDED.penalty_multiplier,
+				prism_final_score              = EXCLUDED.prism_final_score,
+				success_rate                   = EXCLUDED.success_rate,
+				penalty_event_count            = EXCLUDED.penalty_event_count,
+				routing_override_reason        = EXCLUDED.routing_override_reason,
+				routing_computed_final_score   = EXCLUDED.routing_computed_final_score,
+				routing_applied_score          = EXCLUDED.routing_applied_score,
+				lifetime_verified_task_count   = EXCLUDED.lifetime_verified_task_count,
+				computed_at                    = NOW(),
+				updated_at                     = NOW()
 	`;
-	await syncOrchestratorEvidenceTotals(db, orchestratorId, score);
 }
 
+
 export async function applyPoolPromotion(
-	db: DbClient,
+	db: Db,
 	orchestratorId: string,
 	transitionScore: number,
 	seedScore: PrismScoreResult,
@@ -477,8 +446,9 @@ export async function applyPoolPromotion(
 	`;
 }
 
+
 export async function mirrorOrchestratorRoutingScore(
-	db: DbClient,
+	db: Db,
 	orchestrator: OrchestratorPrismRow,
 	routingScore: number,
 	updateConfidence: boolean,
@@ -519,6 +489,18 @@ export async function mirrorOrchestratorRoutingScore(
 	`;
 }
 
+
+export async function clearPrismPoolTransitionPending(db: Db, orchestratorId: string): Promise<void> {
+	await db`
+		UPDATE core.orchestrators
+		SET prism_pool_transition_pending = FALSE,
+			updated_at = NOW()
+		WHERE id = ${orchestratorId}
+			AND prism_pool_transition_pending = TRUE
+	`;
+}
+
+
 export function buildScoreInput(
 	orchestrator: OrchestratorPrismRow,
 	indexes: EvidenceIndexes,
@@ -530,14 +512,19 @@ export function buildScoreInput(
 	targetVerifiedTasks: number,
 	ageSaturationDays: number,
 	graduationConfidence: number,
-) {
+	performanceWeights: PerformanceWeights,
+	options?: { computeConfidence?: boolean },
+): PrismScoreInput {
 	return {
+		verifiedTaskCount: indexes.verifiedTaskCountByOrchestrator.get(orchestrator.id) ?? 0,
+		verifiedTransferCount: indexes.verifiedTransferCountByOrchestrator.get(orchestrator.id) ?? 0,
 		averageVerifiedMbps: indexes.averageMbpsByOrchestrator.get(orchestrator.id) ?? 0,
+		taskHourBuckets: indexes.taskBucketsByOrchestrator.get(orchestrator.id) ?? [],
+		penaltyHourBuckets: indexes.penaltyBucketsByOrchestrator.get(orchestrator.id) ?? [],
+		lifetimeVerifiedTaskCount: indexes.lifetimeVerifiedTaskCountByOrchestrator.get(orchestrator.id) ?? 0,
+		lifetimeVerifiedTransferCount: indexes.lifetimeVerifiedTransferCountByOrchestrator.get(orchestrator.id) ?? 0,
 		throughputRange,
 		reliabilityRange,
-		proofs: indexes.proofsByOrchestrator.get(orchestrator.id) ?? [],
-		tasks: indexes.tasksByOrchestrator.get(orchestrator.id) ?? [],
-		penaltyEvents: indexes.penaltiesByOrchestrator.get(orchestrator.id) ?? [],
 		penaltyCoefficients,
 		readiness: {
 			ready: orchestrator.ready,
@@ -545,26 +532,143 @@ export function buildScoreInput(
 		},
 		evidenceLookbackDays,
 		confidenceTargets: { targetVerifiedTasks, ageSaturationDays },
-		registeredAt: orchestrator.registered_at,
+		registeredAt: orchestrator.prism_age_at ?? orchestrator.registered_at,
 		now,
 		graduationConfidence,
+		performanceWeights,
+		...(options?.computeConfidence !== undefined
+			? { computeConfidence: options.computeConfidence }
+			: {}),
 	};
+}
+
+export interface PrismConfigRow {
+	evidence_lookback_days: number;
+	half_life_hours: number;
+	performance_throughput_weight: number;
+	performance_reliability_weight: number;
+	penalty_coeff_pop: number;
+	penalty_coeff_fraud: number;
+	penalty_coeff_sybil: number;
+	verified_task_target: number;
+	age_saturation_days: number;
+	graduation_confidence: number;
+	fleet_normalization_floor: number;
+	config_synced_at: Date;
+	updated_at: Date;
+}
+
+export async function loadPrismConfig(db: Db): Promise<PrismConfigRow | null> {
+	const rows = await db<PrismConfigRow[]>`
+		SELECT
+			evidence_lookback_days::int AS evidence_lookback_days,
+			half_life_hours::int AS half_life_hours,
+			performance_throughput_weight::float8 AS performance_throughput_weight,
+			performance_reliability_weight::float8 AS performance_reliability_weight,
+			penalty_coeff_pop::float8 AS penalty_coeff_pop,
+			penalty_coeff_fraud::float8 AS penalty_coeff_fraud,
+			penalty_coeff_sybil::float8 AS penalty_coeff_sybil,
+			verified_task_target::int AS verified_task_target,
+			age_saturation_days::int AS age_saturation_days,
+			graduation_confidence::float8 AS graduation_confidence,
+			fleet_normalization_floor::float8 AS fleet_normalization_floor,
+			config_synced_at,
+			updated_at
+		FROM core.prism_config
+		WHERE id = 1
+	`;
+	return rows[0] ?? null;
+}
+
+async function syncOrchestratorPrismRoutingToControlPlane(db: Db): Promise<void> {
+	const rows = await db<
+		{
+			id: string;
+			prism_final_score: string;
+			prism_confidence_score: string;
+			prism_pool: "qualifying" | "qualified";
+		}[]
+	>`
+		SELECT
+			id,
+			prism_final_score::text AS prism_final_score,
+			prism_confidence_score::text AS prism_confidence_score,
+			prism_pool
+		FROM core.orchestrators
+	`;
+	await postRoutingSync("/internal/routing/orchestrators-prism-sync", { rows });
+	logger.debug({ count: rows.length }, "synced orchestrator PRISM routing snapshot to control plane");
+}
+
+function routingScoreForOrchestrator(
+	orchestrator: OrchestratorPrismRow,
+	score: PrismScoreResult,
+): number {
+	if (score.readinessMultiplier <= 0) {
+		return score.prismFinalScore;
+	}
+
+	if (
+		orchestrator.prism_pool === "qualified" &&
+		orchestrator.prism_pool_transition_pending &&
+		hasEmptyQualifiedEvidence(score)
+	) {
+		const previousScore = numberValue(orchestrator.prism_final_score);
+		if (previousScore > 0) return previousScore;
+		return PRISM_DEFAULTS.PRISM_POOL_TRANSITION_SCORE;
+	}
+
+	return score.prismFinalScore;
+}
+
+function hasEmptyQualifiedEvidence(score: PrismScoreResult): boolean {
+	return score.verifiedTaskCount === 0
+		&& score.tasksInWindow === 0
+		&& score.penaltyEventCount === 0;
+}
+
+function scoreWithRoutingOverride(
+	orchestrator: OrchestratorPrismRow,
+	score: PrismScoreResult,
+	routingScore: number,
+): PrismScoreResult {
+	if (routingScore === score.prismFinalScore) return score;
+
+	return withRoutingOverride(
+		score,
+		"transition_pending_empty_qualified_evidence",
+		score.prismFinalScore,
+		routingScore,
+	);
 }
 
 export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	const now = new Date();
-	const graduationConfidence = PRISM_GRADUATION_CONFIDENCE;
-	const transitionScore = PRISM_POOL_TRANSITION_SCORE;
+	const rawConfig = await loadPrismConfig(db);
+	const config = rawConfig ?? {
+		evidence_lookback_days: PRISM_DEFAULTS.PRISM_EVIDENCE_LOOKBACK_DAYS,
+		penalty_coeff_pop: PRISM_DEFAULTS.PRISM_PENALTY_COEFF_POP,
+		penalty_coeff_fraud: PRISM_DEFAULTS.PRISM_PENALTY_COEFF_FRAUD,
+		penalty_coeff_sybil: PRISM_DEFAULTS.PRISM_PENALTY_COEFF_SYBIL,
+		performance_throughput_weight: PRISM_DEFAULTS.PRISM_PERFORMANCE_THROUGHPUT_WEIGHT,
+		performance_reliability_weight: PRISM_DEFAULTS.PRISM_PERFORMANCE_RELIABILITY_WEIGHT,
+		graduation_confidence: PRISM_DEFAULTS.PRISM_GRADUATION_CONFIDENCE,
+		verified_task_target: PRISM_DEFAULTS.PRISM_TARGET_GRADUATION_VERIFIED_TASKS,
+		age_saturation_days: PRISM_DEFAULTS.PRISM_AGE_SATURATION_DAYS,
+	};
+	const lookbackDays = config.evidence_lookback_days;
 
-	const chainRows = await db<{ current_epoch: number | null }[]>`
-		SELECT current_epoch
-		FROM core.chain_state
-		ORDER BY last_synced_at DESC
-		LIMIT 1
-	`;
-	const currentEpoch = chainRows[0]?.current_epoch ?? 0;
-
-	await materializePopPenaltyEvents({ db, currentEpoch });
+	const penaltyCoefficients: PenaltyCoefficients = {
+		pop: config.penalty_coeff_pop,
+		fraud: config.penalty_coeff_fraud,
+		sybil: config.penalty_coeff_sybil,
+	};
+	const performanceWeights: PerformanceWeights = {
+		throughput: config.performance_throughput_weight,
+		reliability: config.performance_reliability_weight,
+	};
+	const graduationConfidence = config.graduation_confidence;
+	const transitionScore = PRISM_DEFAULTS.PRISM_POOL_TRANSITION_SCORE;
 
 	const orchestrators = await db<OrchestratorPrismRow[]>`
 		SELECT
@@ -573,51 +677,55 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 			o.ready,
 			o.control_plane_connected,
 			o.registered_at,
+			COALESCE(o.uid_assigned_at, o.registered_at) AS prism_age_at,
 			o.prism_pool,
 			o.prism_confidence_score::text AS prism_confidence_score,
+			o.prism_final_score::text AS prism_final_score,
 			o.prism_pool_transition_pending
 		FROM core.orchestrators o
 		WHERE o.uid IS NOT NULL
 	`;
 
-	const [testProofs, testTasks, testPenalties, prodProofs, prodTasks, prodPenalties] =
-		await Promise.all([
-			loadPrismProofs(db, LOOKBACK_WINDOW, "qualifying"),
-			loadPrismTasks(db, LOOKBACK_WINDOW, "qualifying"),
-			loadPrismPenaltyEvents(db, currentEpoch, LOOKBACK_WINDOW, "qualifying"),
-			loadPrismProofs(db, LOOKBACK_WINDOW, "qualified"),
-			loadPrismTasks(db, LOOKBACK_WINDOW, "qualified"),
-			loadPrismPenaltyEvents(db, currentEpoch, LOOKBACK_WINDOW, "qualified"),
-		]);
+	const [
+		qualifyingAggs, qualifyingTotals,
+		qualifiedAggs,  qualifiedTotals,
+	] = await Promise.all([
+		loadPrismHourlyAggregates(db, lookbackDays, "qualifying"),
+		loadPrismEvidenceTotals(db, "qualifying"),
+		loadPrismHourlyAggregates(db, lookbackDays, "qualified"),
+		loadPrismEvidenceTotals(db, "qualified"),
+	]);
 
-	const qualifyingIndexes = indexPrismEvidence(
-		testProofs,
-		testTasks,
-		testPenalties,
-		now,
-		PRISM_EVIDENCE_LOOKBACK_DAYS,
-	);
-	const qualifiedIndexes = indexPrismEvidence(
-		prodProofs,
-		prodTasks,
-		prodPenalties,
-		now,
-		PRISM_EVIDENCE_LOOKBACK_DAYS,
-	);
+	const qualifyingIndexes = indexPrismEvidence(qualifyingAggs, qualifyingTotals, now);
+	const qualifiedIndexes  = indexPrismEvidence(qualifiedAggs,  qualifiedTotals,  now);
 
 	const qualifyingOrchestrators = orchestrators.filter((o) => o.prism_pool === "qualifying");
-	const qualifiedOrchestrators = orchestrators.filter((o) => o.prism_pool === "qualified");
+	const qualifiedOrchestrators  = orchestrators.filter((o) => o.prism_pool === "qualified");
 
 	const qualifyingIds = qualifyingOrchestrators.map((o) => o.id);
-	const qualifiedIds = qualifiedOrchestrators.map((o) => o.id);
+	const qualifiedIds  = qualifiedOrchestrators.map((o) => o.id);
 	const qualifyingRange = fleetRangeForCohort(qualifyingIds, qualifyingIndexes);
-	const qualifiedRange = fleetRangeForCohort(qualifiedIds, qualifiedIndexes);
+	const qualifiedRange  = fleetRangeForCohort(qualifiedIds,  qualifiedIndexes);
 
-
+	logger.info(
+		{
+			orchestratorCount: orchestrators.length,
+			qualifyingCount: qualifyingOrchestrators.length,
+			qualifiedCount: qualifiedOrchestrators.length,
+			qualifyingThroughputRange: qualifyingRange.throughputRange,
+			qualifyingReliabilityRange: qualifyingRange.reliabilityRange,
+			qualifiedThroughputRange: qualifiedRange.throughputRange,
+			qualifiedReliabilityRange: qualifiedRange.reliabilityRange,
+			penaltyCoefficients,
+			performanceWeights,
+			graduationConfidence,
+		},
+		"PRISM scoring run started",
+	);
 
 	const promotions: Array<{
 		orchestrator: OrchestratorPrismRow;
-		score: ReturnType<typeof computePrismScore>;
+		score: PrismScoreResult;
 	}> = [];
 
 	for (const orchestrator of qualifyingOrchestrators) {
@@ -628,10 +736,12 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 			qualifyingRange.reliabilityRange,
 			penaltyCoefficients,
 			now,
-			PRISM_EVIDENCE_LOOKBACK_DAYS,
-			PRISM_TARGET_GRADUATION_VERIFIED_TASKS,
-			PRISM_AGE_SATURATION_DAYS,
+			lookbackDays,
+			config.verified_task_target,
+			config.age_saturation_days,
 			graduationConfidence,
+			performanceWeights,
+			{ computeConfidence: true },
 		);
 		const score = computePrismScore(scoreInput);
 		const newPool = resolveNewPool(orchestrator.prism_pool, score.confidenceScore, graduationConfidence);
@@ -642,7 +752,7 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 		}
 
 		await persistQualifyingMetrics(db, orchestrator.id, score);
-		const routingScore = routingScoreForOrchestrator(orchestrator, score.prismFinalScore);
+		const routingScore = routingScoreForOrchestrator(orchestrator, score);
 		await mirrorOrchestratorRoutingScore(
 			db,
 			orchestrator,
@@ -653,8 +763,23 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 		);
 	}
 
-	for (const { orchestrator, score } of promotions) {
-		const seedScore = { ...score, prismFinalScore: transitionScore };
+	for (const { orchestrator } of promotions) {
+		const qualifiedSeedInput = buildScoreInput(
+			orchestrator,
+			qualifiedIndexes,
+			qualifiedRange.throughputRange,
+			qualifiedRange.reliabilityRange,
+			penaltyCoefficients,
+			now,
+			lookbackDays,
+			config.verified_task_target,
+			config.age_saturation_days,
+			graduationConfidence,
+			performanceWeights,
+			{ computeConfidence: false },
+		);
+		const qualifiedSeedScore = computePrismScore(qualifiedSeedInput);
+		const seedScore = { ...qualifiedSeedScore, prismFinalScore: transitionScore };
 		await applyPoolPromotion(db, orchestrator.id, transitionScore, seedScore);
 		orchestrator.prism_pool = "qualified";
 		orchestrator.prism_pool_transition_pending = true;
@@ -668,15 +793,36 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 			qualifiedRange.reliabilityRange,
 			penaltyCoefficients,
 			now,
-			PRISM_EVIDENCE_LOOKBACK_DAYS,
-			PRISM_TARGET_GRADUATION_VERIFIED_TASKS,
-			PRISM_AGE_SATURATION_DAYS,
+			lookbackDays,
+			config.verified_task_target,
+			config.age_saturation_days,
 			graduationConfidence,
+			performanceWeights,
+			{ computeConfidence: false },
 		);
 		const score = computePrismScore(scoreInput);
-		await persistQualifiedMetrics(db, orchestrator.id, score);
-		const routingScore = routingScoreForOrchestrator(orchestrator, score.prismFinalScore);
+		const routingScore = routingScoreForOrchestrator(orchestrator, score);
+		const persistedScore = scoreWithRoutingOverride(orchestrator, score, routingScore);
+		await persistQualifiedMetrics(db, orchestrator.id, persistedScore);
 		await mirrorOrchestratorRoutingScore(db, orchestrator, routingScore, false);
+		if (orchestrator.prism_pool_transition_pending && score.verifiedTaskCount > 0) {
+			await clearPrismPoolTransitionPending(db, orchestrator.id);
+		}
 	}
 
+	if (orchestrators.length > 0) {
+		logger.debug(
+			{
+				count: orchestrators.length,
+				promotions: promotions.length,
+			},
+			"PRISM scores refreshed",
+		);
+	}
+
+	try {
+		await syncOrchestratorPrismRoutingToControlPlane(db);
+	} catch (err) {
+		logger.warn({ err }, "failed to sync PRISM routing snapshot to control plane");
+	}
 };

@@ -1,21 +1,49 @@
 /**
  * Transfer assignment: selects orchestrators by PRISM tier and score, allocates chunk slices,
- * persists assignments, and notifies orchestrators over the live connection registry.
+ * persists assignments, creates task-offer batches, and notifies orchestrators through the live gateway.
  *
  * This transparency copy inlines supporting helpers that live in separate modules in the full
- * BeamCore tree (chunking, transfer-metadata, worker eligibility, orchestrator WebSocket registry).
+ * BeamCore tree (assignment math, transfer metadata, qualified-ring windows, task-offer delivery,
+ * distribute-phase metrics, worker gateway interfaces, and runtime registry interfaces).
  */
+
+import { randomUUID } from "node:crypto";
+
+const logger = {
+	info(_data: unknown, _message?: string): void {},
+	warn(_data: unknown, _message?: string): void {},
+	error(_data: unknown, _message?: string): void {},
+	debug(_data: unknown, _message?: string): void {},
+};
+
+const ASSIGNMENT_DEFAULTS = {
+	WS_ASSIGNMENT_PUSH_RETRY_ATTEMPTS: 3,
+	WS_ASSIGNMENT_PUSH_RETRY_CONCURRENCY: 32,
+	TRANSFER_TASK_OFFER_BATCH_SIZE: 32,
+	TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS: 15,
+	TRANSFER_RECOVERY_TASK_PRIORITY: 10,
+	SIGNED_URL_MIN_TTL_SECONDS: 600,
+	QUALIFIED_WINDOW_RATIO: 0.6,
+	MIN_QUALIFIED_WINDOW_SIZE: 10,
+};
+
+const env = ASSIGNMENT_DEFAULTS;
+
+type SqlTag = <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
+
+export type Db = SqlTag & {
+	begin?: <T>(callback: (sql: SqlTag) => Promise<T>) => Promise<T>;
+	json?: (value: unknown) => unknown;
+	unsafe?: (fragment: string) => unknown;
+};
+
+type DbConn = Db;
 
 /** Minimal WebSocket shape used by the orchestrator registry (production uses `ws`). */
 interface OrchestratorWebSocket {
 	readonly readyState: number;
 	send(data: string): void;
 }
-
-const ZERO_TASK_ASSIGNMENT_TIMEOUT_SECONDS = 5;
-const TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS = 15;
-const QUALIFIED_WINDOW_RATIO = 0.6;
-const MIN_QUALIFIED_WINDOW_SIZE = 10;
 
 type OrchestratorSession =
 	| { kind: "direct"; ws: OrchestratorWebSocket }
@@ -28,7 +56,7 @@ function isOrchestratorConnected(hotkey: string): boolean {
 	return session?.ws.readyState === 1;
 }
 
-function isEligible(hotkey: string): boolean {
+function orchestratorIsEligible(hotkey: string): boolean {
 	return isOrchestratorConnected(hotkey);
 }
 
@@ -47,98 +75,6 @@ function pushToOrchestrator(hotkey: string, msg: unknown): boolean {
 	}
 	session.ws.send(JSON.stringify(msg));
 	return true;
-}
-
-type SqlTag = <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
-
-export type Db = SqlTag & {
-	begin?: <T>(callback: (sql: SqlTag) => Promise<T>) => Promise<T>;
-	json?: (value: unknown) => unknown;
-	unsafe?: (fragment: string) => unknown;
-};
-
-type DbConn = SqlTag;
-
-export interface TransferMetadata {
-	transfer_version?: "legacy" | "signed_url_v1";
-	sources?: unknown[];
-	destinations?: unknown[];
-	chunk_plan?: unknown[];
-	chunk_routes?: unknown[];
-	logical_chunk_count?: number;
-	delivery_task_count?: number;
-	urls_expires_at?: string;
-	name?: string;
-	test_mode?: boolean;
-}
-
-export function parseTransferMetadata(value: unknown): TransferMetadata | null {
-	if (!value) return null;
-	if (typeof value === "string") {
-		try {
-			const parsed = JSON.parse(value) as TransferMetadata;
-			return parsed && typeof parsed === "object" ? parsed : null;
-		} catch {
-			return null;
-		}
-	}
-	return typeof value === "object" ? (value as TransferMetadata) : null;
-}
-
-function computePrismSlices(scores: number[], totalChunks: number): number[] {
-	if (scores.length === 0 || totalChunks <= 0) return [];
-
-	const totalScore = scores.reduce((sum, s) => sum + s, 0);
-
-	if (totalScore <= 0) {
-		const base = Math.floor(totalChunks / scores.length);
-		const rem = totalChunks % scores.length;
-		return scores.map((_, i) => base + (i < rem ? 1 : 0));
-	}
-
-	const quotas = scores.map((s) => (s / totalScore) * totalChunks);
-	const slices = quotas.map((q) => Math.floor(q));
-	let leftover = totalChunks - slices.reduce((a, b) => a + b, 0);
-
-	// Distribute leftover by largest fractional remainder; tie-break: score desc, index asc
-	const order = quotas
-		.map((q, i) => ({ i, frac: q - Math.floor(q), score: scores[i]! }))
-		.sort((a, b) => b.frac - a.frac || b.score - a.score || a.i - b.i);
-
-	for (const { i } of order) {
-		if (leftover <= 0) break;
-		slices[i]!++;
-		leftover--;
-	}
-
-	return slices;
-}
-
-
-function normalizeGatewayUrl(url: string | null | undefined): string | null {
-	if (!url) return null;
-	const trimmed = url.trim();
-	if (!trimmed) return null;
-	return trimmed.replace(/\/+$/, "");
-}
-
-function workerGatewayUrlForType(
-	type: string | null | undefined,
-	url: string | null | undefined,
-	fallbackUrl?: string | null | undefined,
-): string | null {
-	return url ?? fallbackUrl ?? null;
-}
-
-export interface SessionSummary {
-	workerId: string;
-	gatewayMode: "orch_owned";
-	gatewayUrl: string | null;
-	orchestratorId: string | null;
-}
-
-export interface WorkerGatewayClient {
-	getConnectedSessions(): Promise<SessionSummary[]>;
 }
 
 export interface OrchestratorCandidate {
@@ -193,51 +129,259 @@ export interface SelectionResult {
 	};
 }
 
-export interface RecoveryOrchestratorSpeed {
+export interface StaleAssignmentBundle {
+	transferId: string;
+	assignmentId: string;
+	orchestratorId: string;
+	chunkStart: number;
+	chunkEnd: number;
+	totalChunks: number;
+	reason: string;
+}
+
+export interface TransferOrchestratorSpeed {
 	orchestrator_id: string;
-	median_relay_s: number;
+	median_relay_s: number | null;
 	completed_count: number;
+	last_completed_at: Date;
 }
 
-export function medianOf(values: number[]): number | undefined {
-	if (!values.length) return undefined;
-	const sorted = [...values].sort((a, b) => a - b);
-	const mid = Math.floor(sorted.length / 2);
-	if (sorted.length % 2 === 0) {
-		return (sorted[mid - 1]! + sorted[mid]!) / 2;
+export interface RuntimeRegisterOfferInput {
+	taskId: string;
+	transferId: string;
+	totalChunks: number;
+	workerId: string | null;
+	attemptId: string;
+	chunkIndex: number;
+	offeredAt: Date;
+	assignmentId: string;
+	orchestratorId: string;
+	orchestratorHotkey: string;
+	chunkSize: number;
+	executionContext: Record<string, unknown>;
+	idempotencyKey?: string;
+	sourceId: string | null;
+	destinationId: string | null;
+	priority: number;
+}
+
+export interface RuntimeAssignmentSnapshot {
+	assignmentId: string;
+	transferId: string;
+	orchestratorId: string;
+	orchestratorHotkey: string;
+	workerGatewayType: string | null;
+	workerGatewayUrl: string | null;
+	chunkStart: number;
+	chunkEnd: number;
+	totalChunks: number;
+	totalBytes: number;
+	chunkSize: number;
+	metadata: unknown;
+	status: "assigned" | "in_progress" | "completed" | "failed" | "expired";
+}
+
+export interface TransferRecordView {
+	transferId: string;
+	totalChunks: number;
+	totalBytes: number;
+	chunkSize: number;
+	metadata: unknown;
+}
+
+export interface TransferRuntimeRegistry {
+	failTransfer(transferId: string, reason: string): void;
+	createAssignments(input: Omit<RuntimeAssignmentSnapshot, "status">[]): { ok: boolean; reason?: string };
+	registerTransferStarted(input: TransferRecordView): void;
+	getRecoveryExclusions(transferId: string, chunkIndices: number[], excludeOrchestratorIds: string[], routingRegistry: OrchestratorRoutingRegistry): { orchestratorIds: string[]; ownerGroupIds: string[] };
+	getRecoveryOrchestratorSpeeds(transferId: string, windowSeconds: number): TransferOrchestratorSpeed[];
+	recordOverseerIntervention(input: Record<string, unknown>): void;
+	getAssignment(assignmentId: string): RuntimeAssignmentSnapshot | undefined;
+	filterRecoverableChunkIndices(transferId: string, requestedChunks: number[]): number[];
+	getTransferRecord(transferId: string): TransferRecordView | undefined;
+	isRestartRecoveredAssignment(assignmentId: string): boolean;
+	recordRecoveryOutcomeForRange(input: Record<string, unknown>): void;
+	isChunkIndexCompleted(transferId: string, chunkIndex: number): boolean;
+	expireAssignments(transferId: string, chunkIndices: number[], reason: string): void;
+	recordRecoveryOutcomeForChunks(input: Record<string, unknown>): void;
+	recordRecoveryAssignment(input: Record<string, unknown>): void;
+	getTransferSnapshot(transferId: string): TerminalTransferSnapshot | undefined;
+	getActiveTasksForChunks(transferId: string, chunkIndices: number[]): RuntimeTaskSnapshot[];
+	updateAssignmentStatus(assignmentId: string, status: string, reason?: string): void;
+	isRecoveryAssignment(input: Record<string, unknown>): boolean;
+	createTaskOffers(input: RuntimeRegisterOfferInput[]): { ok: boolean; reason?: string; tasks: Array<{ id: string; attemptId: string; chunkIndex: number }> };
+	expireRecoveryZeroOfferAssignment(input: Record<string, unknown>): boolean;
+	markAssignmentInProgress(assignmentId: string, offeredAt: Date): void;
+	recordOfferDelivery(taskId: string, accepted: boolean, reason: string | null): void;
+	recordFailure(input: Record<string, unknown>): void;
+	invalidateTask(taskId: string): void;
+}
+
+export interface RuntimeTaskSnapshot {
+	taskId: string;
+	transferId: string;
+	totalChunks: number;
+	assignmentId: string | null;
+	orchestratorId: string | null;
+	orchestratorHotkey: string | null;
+	chunkIndex: number;
+	chunkSize: number | null;
+	workerId: string | null;
+	attemptId: string;
+	state: string;
+}
+
+export interface TerminalTransferSnapshot {
+	transferId: string;
+	status: "cancelled" | "failed" | "completed";
+	reason: string;
+	totalChunks: number;
+	completedChunks: number;
+	assignments: RuntimeAssignmentSnapshot[];
+	tasks: RuntimeTaskSnapshot[];
+	capturedAt: Date;
+}
+
+export interface OrchestratorRoutingRegistry {
+	listReadyCandidates(excludeIds: string[], excludeOwnerGroupIds: string[]): OrchestratorCandidate[];
+	getOwnerGroupId(orchestratorId: string): string | null;
+	getQualifiedRingCursor(): bigint;
+	advanceQualifiedRingCursor(next: bigint): void;
+}
+
+export interface DeliveryResult {
+	accepted: boolean;
+	reason?: string;
+}
+
+export interface TaskOfferBatchOffer {
+	task_id: string;
+	offer_id: string;
+	chunk_size: number;
+	source_url: string;
+	dest_url: string;
+	urls_expires_at: string;
+	etag_required?: boolean;
+	source_headers?: Record<string, string>;
+	dest_headers?: Record<string, string>;
+}
+
+export interface WorkerGatewayClient {
+	deliverTaskOfferBatch(orchestratorHotkey: string, batch: { batch_id: string; offers: TaskOfferBatchOffer[] }, channel: "orchestrator_ws"): Promise<DeliveryResult>;
+}
+
+export interface SignedChunkRoute {
+	source_id: string;
+	destination_id: string;
+	chunk_index: number;
+	delivery_index?: number;
+	source_offset?: number;
+	chunk_size: number;
+	source_url: string;
+	dest_url: string;
+	expires_at?: string;
+	headers?: Record<string, string>;
+	metadata?: Record<string, unknown>;
+}
+
+function routeKey(sourceId: string, chunkIndex: number, destinationId: string): string {
+	return `${sourceId}:${chunkIndex}:${destinationId}`;
+}
+
+function assertSignedUrlsFresh(input: { expiresAt?: string; minTtlSeconds: number; label: string }): void {
+	if (!input.expiresAt) return;
+	const expiresAt = Date.parse(input.expiresAt);
+	if (!Number.isFinite(expiresAt)) throw new Error(`${input.label} has invalid expiration`);
+	if (expiresAt - Date.now() < input.minTtlSeconds * 1000) {
+		throw new Error(`${input.label} signed URLs expire too soon`);
 	}
-	return sorted[mid];
 }
 
-export function applyHotOrchestratorCarveOut(input: {
-	excludedOrchestratorIds: string[];
-	ownerGroupIdsByOrch: Map<string, string | null>;
-	speeds: RecoveryOrchestratorSpeed[];
-	activeStallOwnerIds: Set<string>;
-}): { orchestratorIds: string[]; ownerGroupIds: string[] } {
-	const completers = input.speeds.filter((row) => row.completed_count >= 1);
-	const transferMedianP50 = medianOf(completers.map((row) => row.median_relay_s));
-	const hotOrchIds = new Set(
-		completers
-			.filter(
-				(row) =>
-					transferMedianP50 !== undefined &&
-					row.median_relay_s <= transferMedianP50,
-			)
-			.map((row) => row.orchestrator_id),
-	);
+function isS3Config(value: unknown): boolean {
+	return Boolean(value && typeof value === "object" && "bucket" in value && "key" in value);
+}
 
-	const filteredIds = input.excludedOrchestratorIds.filter(
-		(id) => !hotOrchIds.has(id) || input.activeStallOwnerIds.has(id),
-	);
-	const ownerGroupIds = [
-		...new Set(
-			filteredIds
-				.map((id) => input.ownerGroupIdsByOrch.get(id))
-				.filter((id): id is string => Boolean(id)),
-		),
-	];
-	return { orchestratorIds: filteredIds, ownerGroupIds };
+async function presignGet(value: unknown): Promise<string> {
+	return fallbackUrl(value);
+}
+
+async function presignPut(value: unknown, _chunkIndex: number): Promise<string> {
+	return fallbackUrl(value);
+}
+
+function logWorkerTaskOfferDelivery(_input: Record<string, unknown>): void {}
+
+function computePrismSlices(scores: number[], totalChunks: number): number[] {
+	if (scores.length === 0 || totalChunks <= 0) return [];
+
+	const totalScore = scores.reduce((sum, s) => sum + s, 0);
+	if (totalScore <= 0) {
+		const base = Math.floor(totalChunks / scores.length);
+		const rem = totalChunks % scores.length;
+		return scores.map((_, i) => base + (i < rem ? 1 : 0));
+	}
+
+	const quotas = scores.map((s) => (s / totalScore) * totalChunks);
+	const slices = quotas.map((q) => Math.floor(q));
+	let leftover = totalChunks - slices.reduce((a, b) => a + b, 0);
+
+	const order = quotas
+		.map((q, i) => ({ i, frac: q - Math.floor(q), score: scores[i]! }))
+		.sort((a, b) => b.frac - a.frac || b.score - a.score || a.i - b.i);
+
+	for (const { i } of order) {
+		if (leftover <= 0) break;
+		slices[i]!++;
+		leftover--;
+	}
+
+	return slices;
+}
+export interface TransferMetadata {
+	transfer_version?: "legacy" | "signed_url_v1" | "signed_url_v2";
+	sources?: unknown[];
+	destinations?: unknown[];
+	chunk_plan?: unknown[];
+	chunk_routes?: unknown[];
+	logical_chunk_count?: number;
+	delivery_task_count?: number;
+	urls_expires_at?: string;
+	name?: string;
+	test_mode?: boolean;
+}
+
+export function parseTransferMetadata(value: unknown): TransferMetadata | null {
+	if (!value) return null;
+	if (typeof value === "string") {
+		try {
+			const parsed = JSON.parse(value) as TransferMetadata;
+			return parsed && typeof parsed === "object" ? parsed : null;
+		} catch {
+			return null;
+		}
+	}
+	return typeof value === "object" ? (value as TransferMetadata) : null;
+}
+
+export function isSignedUrlTransferVersion(version: unknown): boolean {
+	return version === "signed_url_v1" || version === "signed_url_v2";
+}
+
+export function isSignedUrlTransferMetadata(metadata: unknown): boolean {
+	return isSignedUrlTransferVersion(parseTransferMetadata(metadata)?.transfer_version);
+}
+
+export function isSignedUrlV2TransferMetadata(metadata: unknown): boolean {
+	return parseTransferMetadata(metadata)?.transfer_version === "signed_url_v2";
+}
+
+/** Chunk indices `0…N−1` for overseer coverage, finalize, and missing-index scans. */
+export function resolveOverseerTotalChunks(totalChunks: number, metadata: unknown): number {
+	const meta = parseTransferMetadata(metadata);
+	if (isSignedUrlTransferVersion(meta?.transfer_version) && typeof meta?.logical_chunk_count === "number") {
+		return meta.logical_chunk_count;
+	}
+	return totalChunks;
 }
 
 export function numericValue(value: string | number | null | undefined, fallback = 0): number {
@@ -387,7 +531,7 @@ interface WindowGroup {
 	members: OrchestratorCandidate[];
 }
 
-function compareUidAscNullsLast(a: number | null, b: number | null): number {
+function compareWindowUidAscNullsLast(a: number | null, b: number | null): number {
 	if (a === null && b === null) return 0;
 	if (a === null) return 1;
 	if (b === null) return -1;
@@ -397,7 +541,7 @@ function compareUidAscNullsLast(a: number | null, b: number | null): number {
 function sortMembers(members: OrchestratorCandidate[]): OrchestratorCandidate[] {
 	return [...members].sort(
 		(a, b) =>
-			compareUidAscNullsLast(a.uid, b.uid) ||
+			compareWindowUidAscNullsLast(a.uid, b.uid) ||
 			a.hotkey.localeCompare(b.hotkey) ||
 			a.id.localeCompare(b.id),
 	);
@@ -524,18 +668,606 @@ export function buildQualifiedWindowSlicePlan(input: {
 	};
 }
 
+export interface DistributePhaseMetrics {
+	transferId: string;
+	assignmentCount: number;
+	startedAtMs: number;
+	wsPushSuccess: number;
+	wsPushFailed: number;
+	chunkAssignmentHandlerMs: number[];
+	initialChunkAssignmentHandlerMs: number[];
+	recoveryChunkAssignmentHandlerMs: number[];
+	staleRecoveryCount: number;
+	resendPushCount: number;
+}
 
-function extractDestinationUrl(meta: TransferMetadata | null): string {
-	const dests = (meta?.destinations as unknown[]) ?? [];
-	const first = dests[0];
-	if (!first || typeof first !== "object") return "";
-	const maybeUrl = (first as { url?: unknown }).url;
+const trackers = new Map<string, DistributePhaseMetrics>();
+
+function percentile(sorted: number[], p: number): number | null {
+	if (!sorted.length) return null;
+	const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+	return sorted[index] ?? null;
+}
+
+export function beginDistributePhase(transferId: string, assignmentCount: number): void {
+	trackers.set(transferId, {
+		transferId,
+		assignmentCount,
+		startedAtMs: Date.now(),
+		wsPushSuccess: 0,
+		wsPushFailed: 0,
+		chunkAssignmentHandlerMs: [],
+		initialChunkAssignmentHandlerMs: [],
+		recoveryChunkAssignmentHandlerMs: [],
+		staleRecoveryCount: 0,
+		resendPushCount: 0,
+	});
+}
+
+export function recordWsPushResult(transferId: string, success: boolean): void {
+	const tracker = trackers.get(transferId);
+	if (!tracker) return;
+	if (success) tracker.wsPushSuccess += 1;
+	else tracker.wsPushFailed += 1;
+}
+
+export function recordChunkAssignmentHandlerMs(
+	transferId: string,
+	ms: number,
+	phase: "initial" | "recovery" = "initial",
+): void {
+	const tracker = trackers.get(transferId);
+	if (!tracker) return;
+	tracker.chunkAssignmentHandlerMs.push(ms);
+	if (phase === "recovery") {
+		tracker.recoveryChunkAssignmentHandlerMs.push(ms);
+	} else {
+		tracker.initialChunkAssignmentHandlerMs.push(ms);
+	}
+}
+
+export function recordStaleRecovery(transferId: string): void {
+	const tracker = trackers.get(transferId);
+	if (!tracker) return;
+	tracker.staleRecoveryCount += 1;
+}
+
+export function recordResendPush(transferId: string, count = 1): void {
+	const tracker = trackers.get(transferId);
+	if (!tracker) return;
+	tracker.resendPushCount += count;
+}
+
+export function getDistributePhaseMetrics(transferId: string): DistributePhaseMetrics | undefined {
+	return trackers.get(transferId);
+}
+
+export function summarizeHandlerMs(samples: number[]): { p50: number | null; p95: number | null; count: number } {
+	const sorted = [...samples].sort((a, b) => a - b);
+	return {
+		count: sorted.length,
+		p50: percentile(sorted, 50),
+		p95: percentile(sorted, 95),
+	};
+}
+
+export function logDistributePhaseSummary(transferId: string, extra?: Record<string, unknown>): void {
+	const tracker = trackers.get(transferId);
+	if (!tracker) return;
+	const handler = summarizeHandlerMs(tracker.chunkAssignmentHandlerMs);
+	logger.info(
+		{
+			transferId,
+			assignmentCount: tracker.assignmentCount,
+			elapsedMs: Date.now() - tracker.startedAtMs,
+			wsPushSuccess: tracker.wsPushSuccess,
+			wsPushFailed: tracker.wsPushFailed,
+			resendPushCount: tracker.resendPushCount,
+			staleRecoveryCount: tracker.staleRecoveryCount,
+			chunkAssignmentsHandlerCount: handler.count,
+			chunkAssignmentsHandlerP50Ms: handler.p50 != null ? Math.round(handler.p50) : null,
+			chunkAssignmentsHandlerP95Ms: handler.p95 != null ? Math.round(handler.p95) : null,
+			...extra,
+		},
+		"distribute phase metrics",
+	);
+}
+
+type PreparedTaskOffer = {
+	sourceId: string | null;
+	destinationId: string | null;
+	chunkIndex: number;
+	chunkSize: number;
+	executionContext: Record<string, unknown>;
+	idempotencyKey: string;
+	workerOffer: Omit<TaskOfferBatchOffer, "task_id" | "offer_id">;
+};
+
+export interface DeliveredTaskOffer {
+	id: string;
+	offerId: string;
+	chunkIndex: number;
+	chunkSize: number;
+	deliveryAccepted: boolean;
+	deliveryReason?: string;
+}
+
+export type TaskOfferBatchDeliveryResult = {
+	ok: boolean;
+	tasks?: DeliveredTaskOffer[];
+	code?: string;
+	message?: string;
+};
+
+export interface DeliverTaskOfferBatchInput {
+	gatewayClient: WorkerGatewayClient;
+	batchId: string;
+	expectedOrchestratorId?: string;
+	recoveryBatch?: boolean;
+	offerRegistry: TransferRuntimeRegistry;
+}
+
+function routeMetadata(route: SignedChunkRoute): Record<string, unknown> {
+	return route.metadata && typeof route.metadata === "object" ? route.metadata : {};
+}
+
+function metadataString(meta: Record<string, unknown>, key: string): string | undefined {
+	const value = meta[key];
+	if (typeof value === "string") return value;
+	if (typeof value === "number") return String(value);
+	return undefined;
+}
+
+function metadataNumber(meta: Record<string, unknown>, key: string): number | undefined {
+	const value = meta[key];
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+	return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function transferTaskIdempotencyKey(
+	transferId: string,
+	assignment: { chunkIndex: number; sourceId: string | null; destinationId: string | null },
+): string {
+	if (assignment.sourceId && assignment.destinationId) {
+		return `${transferId}:${assignment.sourceId}:${assignment.chunkIndex}:${assignment.destinationId}`;
+	}
+	return `${transferId}:${assignment.chunkIndex}`;
+}
+
+function fallbackUrl(value: unknown): string {
+	if (!value || typeof value !== "object") {
+		return "";
+	}
+
+	const maybeUrl = (value as { url?: unknown }).url;
 	return typeof maybeUrl === "string" ? maybeUrl : "";
+}
+
+function fallbackHeaders(value: unknown): Record<string, string> | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const headers = (value as { headers?: unknown }).headers;
+	if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+		return undefined;
+	}
+	const clean: Record<string, string> = {};
+	for (const [key, raw] of Object.entries(headers as Record<string, unknown>)) {
+		if (typeof raw === "string") {
+			clean[key] = raw;
+		}
+	}
+	return Object.keys(clean).length ? clean : undefined;
+}
+
+function offerExpiry(metaExpiry?: string): string {
+	return metaExpiry ?? new Date(Date.now() + ASSIGNMENT_DEFAULTS.SIGNED_URL_MIN_TTL_SECONDS * 1_000).toISOString();
+}
+
+function resolveSignedRoutesForBatchChunk(
+	signedRoutesByKey: Map<string, SignedChunkRoute>,
+	routesByChunkIndex: Map<number, SignedChunkRoute[]>,
+	routesByDeliveryIndex: Map<number, SignedChunkRoute>,
+	chunkIndex: number,
+): SignedChunkRoute[] {
+	const deliveryRoute = routesByDeliveryIndex.get(chunkIndex);
+	if (deliveryRoute) {
+		return [deliveryRoute];
+	}
+	const exactRoutes = routesByChunkIndex.get(chunkIndex) ?? [];
+	if (exactRoutes.length) {
+		return exactRoutes;
+	}
+	const exact = [...signedRoutesByKey.values()].find((route) => route.chunk_index === chunkIndex);
+	return exact ? [exact] : [];
+}
+
+async function prepareTaskOffers(input: {
+	batchId: string;
+	offerRegistry: TransferRuntimeRegistry;
+}): Promise<PreparedTaskOffer[]> {
+	const runtimeBatch = input.offerRegistry.getAssignment(input.batchId);
+	if (!runtimeBatch) {
+		throw new Error(`task offer batch ${input.batchId} not found`);
+	}
+	const {
+		transferId,
+		workerGatewayUrl,
+		totalBytes,
+		chunkSize,
+		chunkStart,
+		chunkEnd,
+		totalChunks,
+		metadata,
+	} = runtimeBatch;
+
+	const meta = parseTransferMetadata(metadata);
+	const rawSources: unknown[] = (meta?.sources as unknown[]) ?? [];
+	const rawDests: unknown[] = (meta?.destinations as unknown[]) ?? [];
+	const signedRoutesByKey = new Map<string, SignedChunkRoute>();
+	const signedRoutesByChunkIndex = new Map<number, SignedChunkRoute[]>();
+	const signedRoutesByDeliveryIndex = new Map<number, SignedChunkRoute>();
+	if (meta && isSignedUrlTransferVersion(meta.transfer_version)) {
+		for (const route of (meta.chunk_routes as SignedChunkRoute[] | undefined) ?? []) {
+			signedRoutesByKey.set(routeKey(route.source_id, route.chunk_index, route.destination_id), route);
+		}
+		for (const route of signedRoutesByKey.values()) {
+			const bucket = signedRoutesByChunkIndex.get(route.chunk_index) ?? [];
+			bucket.push(route);
+			signedRoutesByChunkIndex.set(route.chunk_index, bucket);
+			const routeMeta = routeMetadata(route);
+			const deliveryIndex = route.delivery_index ?? metadataNumber(routeMeta, "delivery_index");
+			if (deliveryIndex !== undefined) {
+				signedRoutesByDeliveryIndex.set(deliveryIndex, route);
+			}
+		}
+	}
+
+	const totalBytesNumber = Number(totalBytes);
+	const src = rawSources[0];
+	const sourceUrl = isS3Config(src) ? await presignGet(src).catch(() => fallbackUrl(src)) : fallbackUrl(src);
+	const sourceHeaders = fallbackHeaders(src);
+	const prepared: PreparedTaskOffer[] = [];
+
+	for (let chunkIndex = chunkStart; chunkIndex <= chunkEnd; chunkIndex += 1) {
+		const chunkKey = String(chunkIndex);
+		const chunkOffset = chunkIndex * chunkSize;
+		const actualChunkSize = Math.max(0, Math.min(chunkSize, totalBytesNumber - chunkOffset));
+
+		if (meta && isSignedUrlTransferVersion(meta.transfer_version)) {
+			const routes = resolveSignedRoutesForBatchChunk(
+				signedRoutesByKey,
+				signedRoutesByChunkIndex,
+				signedRoutesByDeliveryIndex,
+				chunkIndex,
+			);
+			if (!routes.length) {
+				throw new Error(`missing signed routes for chunk ${chunkIndex}`);
+			}
+			for (const route of routes) {
+				const routeExpiresAt = route.expires_at ?? meta.urls_expires_at;
+				assertSignedUrlsFresh({
+					expiresAt: routeExpiresAt,
+					minTtlSeconds: ASSIGNMENT_DEFAULTS.SIGNED_URL_MIN_TTL_SECONDS,
+					label: `route ${route.source_id}:${route.chunk_index}:${route.destination_id}`,
+				});
+				const routeMeta = routeMetadata(route);
+				const uploadId = metadataString(routeMeta, "upload_id");
+				const deliveryIndex = route.delivery_index ?? metadataNumber(routeMeta, "delivery_index") ?? chunkIndex;
+				const multipartMetadata = meta.transfer_version === "signed_url_v2"
+					? {
+							transfer_id: metadataString(routeMeta, "transfer_id") ?? transferId,
+							source_id: route.source_id,
+							destination_id: route.destination_id,
+							chunk_index: route.chunk_index,
+							delivery_index: deliveryIndex,
+							part_number: metadataString(routeMeta, "part_number"),
+							staging_object_key:
+								metadataString(routeMeta, "staging_object_key") ?? metadataString(routeMeta, "object_key"),
+							commit_method: metadataString(routeMeta, "commit_method"),
+							multipart_group_id: metadataString(routeMeta, "multipart_group_id"),
+							multipart_created_at: metadataString(routeMeta, "multipart_created_at"),
+							urls_expires_at: routeExpiresAt,
+						}
+					: {
+							transfer_id: metadataString(routeMeta, "transfer_id") ?? transferId,
+							source_id: route.source_id,
+							destination_id: route.destination_id,
+							chunk_index: route.chunk_index,
+							delivery_index: deliveryIndex,
+							upload_id: uploadId,
+							part_number: metadataString(routeMeta, "part_number"),
+							list_url: metadataString(routeMeta, "list_url"),
+							final_object_key:
+								metadataString(routeMeta, "final_object_key") ?? metadataString(routeMeta, "object_key"),
+							multipart_group_id: metadataString(routeMeta, "multipart_group_id"),
+							multipart_created_at: metadataString(routeMeta, "multipart_created_at"),
+							urls_expires_at: routeExpiresAt,
+						};
+				const executionContext: Record<string, unknown> = {
+					gateway_url: workerGatewayUrl,
+					transfer_id: transferId,
+					chunk_indices: [chunkIndex],
+					chunk_offset: route.source_offset ?? chunkOffset,
+					chunk_size: route.chunk_size,
+					total_size: totalBytesNumber,
+					source_urls: { [chunkKey]: route.source_url },
+					dest_urls: { [chunkKey]: route.dest_url },
+					source_id: route.source_id,
+					destination_id: route.destination_id,
+					delivery_index: deliveryIndex,
+					route_chunk_index: route.chunk_index,
+					urls_expires_at: routeExpiresAt,
+					multipart_metadata: multipartMetadata,
+				};
+				prepared.push({
+					sourceId: route.source_id,
+					destinationId: route.destination_id,
+					chunkIndex,
+					chunkSize: route.chunk_size,
+					executionContext,
+					idempotencyKey: transferTaskIdempotencyKey(transferId, {
+						chunkIndex,
+						sourceId: route.source_id,
+						destinationId: route.destination_id,
+					}),
+					workerOffer: {
+						chunk_size: route.chunk_size,
+						source_url: route.source_url,
+						dest_url: route.dest_url,
+						urls_expires_at: offerExpiry(routeExpiresAt),
+						etag_required: true,
+						...(route.headers ? { source_headers: route.headers } : {}),
+					},
+				});
+			}
+			continue;
+		}
+
+		const dst = rawDests.length > 1 ? (rawDests[chunkIndex] ?? rawDests[0]) : rawDests[0];
+		const destUrl = isS3Config(dst) ? await presignPut(dst, chunkIndex).catch(() => fallbackUrl(dst)) : fallbackUrl(dst);
+		const destHeaders = fallbackHeaders(dst);
+		const executionContext: Record<string, unknown> = {
+			gateway_url: workerGatewayUrl,
+			transfer_id: transferId,
+			chunk_indices: [chunkIndex],
+			chunk_offset: chunkOffset,
+			chunk_size: actualChunkSize,
+			total_size: totalBytesNumber,
+			source_urls: { [chunkKey]: sourceUrl },
+			dest_urls: { [chunkKey]: destUrl },
+		};
+
+		prepared.push({
+			sourceId: null,
+			destinationId: null,
+			chunkIndex,
+			chunkSize: actualChunkSize,
+			executionContext,
+			idempotencyKey: transferTaskIdempotencyKey(transferId, {
+				chunkIndex,
+				sourceId: null,
+				destinationId: null,
+			}),
+			workerOffer: {
+				chunk_size: actualChunkSize,
+				source_url: sourceUrl,
+				dest_url: destUrl,
+				urls_expires_at: offerExpiry(meta?.urls_expires_at),
+				...(sourceHeaders ? { source_headers: sourceHeaders } : {}),
+				...(destHeaders ? { dest_headers: destHeaders } : {}),
+			},
+		});
+	}
+
+	if (!prepared.length && totalChunks > 0) {
+		throw new Error(`task offer batch ${input.batchId} produced no offers`);
+	}
+	return prepared;
+}
+
+function minimalBatchOffer(created: { id: string; attemptId: string; chunkIndex: number }, prepared: PreparedTaskOffer): TaskOfferBatchOffer {
+	return {
+		task_id: created.id,
+		offer_id: created.attemptId,
+		...prepared.workerOffer,
+	};
+}
+
+async function markDeliveryFailed(
+	registry: TransferRuntimeRegistry,
+	taskId: string,
+	attemptId: string,
+	reason: string,
+): Promise<void> {
+	registry.recordOfferDelivery(taskId, false, reason);
+	registry.recordFailure({ taskId, attemptId, reason, kind: "failure" });
+	registry.invalidateTask(taskId);
+}
+
+export async function deliverTaskOfferBatchForAssignment(
+	input: DeliverTaskOfferBatchInput,
+): Promise<TaskOfferBatchDeliveryResult> {
+	const startedAt = performance.now();
+	const runtimeBatch = input.offerRegistry.getAssignment(input.batchId);
+	if (!runtimeBatch) {
+		return { ok: false, code: "batch_not_found", message: "task offer batch not found" };
+	}
+	if (input.expectedOrchestratorId && runtimeBatch.orchestratorId !== input.expectedOrchestratorId) {
+		return { ok: false, code: "wrong_orchestrator", message: "task offer batch belongs to another orchestrator" };
+	}
+	if (!["assigned", "in_progress"].includes(runtimeBatch.status)) {
+		return { ok: false, code: "batch_not_active", message: "task offer batch is not active" };
+	}
+
+	let prepared: PreparedTaskOffer[];
+	try {
+		prepared = await prepareTaskOffers({ batchId: input.batchId, offerRegistry: input.offerRegistry });
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return { ok: false, code: "batch_prepare_failed", message };
+	}
+
+	const recoveryBatch =
+		input.recoveryBatch ??
+		input.offerRegistry.isRecoveryAssignment({
+			assignmentId: input.batchId,
+			transferId: runtimeBatch.transferId,
+			chunkStart: runtimeBatch.chunkStart,
+			chunkEnd: runtimeBatch.chunkEnd,
+		});
+	const taskPriority = recoveryBatch ? ASSIGNMENT_DEFAULTS.TRANSFER_RECOVERY_TASK_PRIORITY : 0;
+	const offeredAt = new Date();
+	const offersToCreate: RuntimeRegisterOfferInput[] = prepared.map((offer) => ({
+		taskId: randomUUID(),
+		transferId: runtimeBatch.transferId,
+		totalChunks: runtimeBatch.totalChunks,
+		workerId: null,
+		attemptId: randomUUID(),
+		chunkIndex: offer.chunkIndex,
+		offeredAt,
+		assignmentId: input.batchId,
+		orchestratorId: runtimeBatch.orchestratorId,
+		orchestratorHotkey: runtimeBatch.orchestratorHotkey,
+		chunkSize: offer.chunkSize,
+		executionContext: offer.executionContext,
+		idempotencyKey: offer.idempotencyKey,
+		sourceId: offer.sourceId,
+		destinationId: offer.destinationId,
+		priority: taskPriority,
+	}));
+
+	const created = input.offerRegistry.createTaskOffers(offersToCreate);
+	if (!created.ok) {
+		return {
+			ok: false,
+			code: "task_offer_create_failed",
+			message: created.reason ?? "task offer creation failed",
+			tasks: [],
+		};
+	}
+	if (!created.tasks.length) {
+		const expired = input.offerRegistry.expireRecoveryZeroOfferAssignment({
+			assignmentId: input.batchId,
+			transferId: runtimeBatch.transferId,
+			orchestratorId: runtimeBatch.orchestratorId,
+			chunkStart: runtimeBatch.chunkStart,
+			chunkEnd: runtimeBatch.chunkEnd,
+			totalChunks: runtimeBatch.totalChunks,
+			reason: "task_offer_batch_produced_no_tasks",
+		});
+		return {
+			ok: false,
+			code: expired ? "batch_produced_no_tasks" : "no_new_task_offers",
+			message: "task offer batch produced no new task offers",
+			tasks: [],
+		};
+	}
+
+	const preparedByKey = new Map(prepared.map((offer) => [offer.idempotencyKey, offer]));
+	const createByTaskId = new Map(offersToCreate.map((offer) => [offer.taskId, offer]));
+	const taskOffers = created.tasks.map((task) => {
+		const create = createByTaskId.get(task.id);
+		const preparedOffer = create ? preparedByKey.get(create.idempotencyKey ?? create.taskId) : undefined;
+		if (!preparedOffer) {
+			throw new Error(`prepared worker offer missing for task ${task.id}`);
+		}
+		return {
+			created: task,
+			prepared: preparedOffer,
+			offer: minimalBatchOffer(task, preparedOffer),
+		};
+	});
+
+	input.offerRegistry.markAssignmentInProgress(input.batchId, offeredAt);
+
+	const tasks: DeliveredTaskOffer[] = [];
+	const batchSize = Math.max(1, ASSIGNMENT_DEFAULTS.TRANSFER_TASK_OFFER_BATCH_SIZE);
+	for (let offset = 0; offset < taskOffers.length; offset += batchSize) {
+		const slice = taskOffers.slice(offset, offset + batchSize);
+		const batchId = offset === 0 ? input.batchId : `${input.batchId}:${Math.floor(offset / batchSize) + 1}`;
+		const queueToPushMs = performance.now() - startedAt;
+		const pushStart = performance.now();
+		const delivery = await input.gatewayClient
+			.deliverTaskOfferBatch(runtimeBatch.orchestratorHotkey, {
+				batch_id: batchId,
+				offers: slice.map((task) => task.offer),
+			}, "orchestrator_ws")
+			.catch((err: unknown) => ({
+				accepted: false,
+				reason: err instanceof Error ? err.message : String(err),
+			}));
+		const pushMs = performance.now() - pushStart;
+
+		for (const task of slice) {
+			logWorkerTaskOfferDelivery({
+				orchestratorHotkey: runtimeBatch.orchestratorHotkey,
+				transferId: runtimeBatch.transferId,
+				taskId: task.created.id,
+				offerId: task.created.attemptId,
+				chunkIndex: task.created.chunkIndex,
+				deliveryChannel: "orchestrator_ws",
+				queueToPushMs,
+				pushMs,
+				deliveryAccepted: delivery.accepted,
+				...(delivery.reason ? { reason: delivery.reason } : {}),
+			});
+
+			if (!delivery.accepted) {
+				await markDeliveryFailed(
+					input.offerRegistry,
+					task.created.id,
+					task.created.attemptId,
+					delivery.reason ?? "batch_delivery_failed",
+				);
+			} else {
+				input.offerRegistry.recordOfferDelivery(task.created.id, true, null);
+			}
+			tasks.push({
+				id: task.created.id,
+				offerId: task.created.attemptId,
+				chunkIndex: task.created.chunkIndex,
+				chunkSize: task.prepared.chunkSize,
+				deliveryAccepted: delivery.accepted,
+				...(delivery.reason ? { deliveryReason: delivery.reason } : {}),
+			});
+		}
+	}
+
+	const acceptedCount = tasks.filter((task) => task.deliveryAccepted).length;
+	logger.info(
+		{
+			batchId: input.batchId,
+			transferId: runtimeBatch.transferId,
+			orchestratorId: runtimeBatch.orchestratorId,
+			offerCount: tasks.length,
+			acceptedCount,
+			queueMs: Math.round(performance.now() - startedAt),
+			batchPhase: recoveryBatch ? "recovery" : "initial",
+		},
+		"task offer batch delivered",
+	);
+
+	if (acceptedCount === 0) {
+		return {
+			ok: false,
+			code: "batch_delivery_failed",
+			message: "task offer batch delivery failed",
+			tasks,
+		};
+	}
+	return { ok: true, tasks };
+}
+
+function sleepMs(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export interface AssignmentEngineDeps {
 	db: Db;
 	gatewayClient: WorkerGatewayClient;
+	offerRegistry: TransferRuntimeRegistry;
+	routingRegistry: OrchestratorRoutingRegistry;
 }
 
 
@@ -546,15 +1278,6 @@ interface AssignmentLogicSummary {
 	candidateScreening: string;
 	distributionDecision: string;
 	qualifiedSelectionNarrative?: string;
-}
-
-interface TransferAssignmentSlice {
-	transferId: string;
-	orchestratorId: string;
-	chunkStart: number;
-	chunkEnd: number;
-	totalChunks: number;
-	chunkSize: number;
 }
 
 interface AssignmentCoverageResult {
@@ -586,21 +1309,6 @@ export interface ReassignChunkBundleResult {
 	remainingChunkCount?: number;
 }
 
-export interface StaleAssignmentEntry {
-	id: string;
-	orchestratorId: string;
-	chunkStart: number;
-	chunkEnd: number;
-}
-
-export interface StaleAssignmentBundle {
-	transferId: string;
-	chunkIndices: number[];
-	excludeOrchestratorIds: string[];
-	staleAssignmentIds: string[];
-	staleAssignments: StaleAssignmentEntry[];
-}
-
 interface VirtualAssignmentRow {
 	orchestrator: OrchestratorCandidate;
 	chunkStart: number;
@@ -622,11 +1330,10 @@ interface BundleTaskBefore {
 	assigned_worker_id: string | null;
 }
 
-interface TransferOrchestratorSpeed {
-	orchestrator_id: string;
-	median_relay_s: number | null;
-	last_completed_at: Date;
-	completed_count: number;
+type AssignmentPool = "qualifying" | "qualified";
+
+function requiredPoolForTransfer(testMode: boolean): AssignmentPool {
+	return testMode ? "qualifying" : "qualified";
 }
 
 export function groupContiguousChunkIndices(indices: number[]): Array<{ chunkStart: number; chunkEnd: number }> {
@@ -671,8 +1378,6 @@ export function mapVirtualBundleToRows(
 function interventionOutcomeForReason(reason: string): string {
 	return reason === "missing_chunk_coverage" ? "missing_coverage_assigned" : "stall_redistributed";
 }
-
-type AssignmentFailureType = "stale_assignment_timeout" | "ws_push_failed";
 
 const COVERAGE_FAILURE_MESSAGE =
 	"transfer assignment failed because not all chunks could be assigned to live orchestrators";
@@ -836,166 +1541,107 @@ function buildAssignmentLogicSummary(
 	return summary;
 }
 
-function assertRequiredPoolSelection(selection: SelectionResult, testMode: boolean, transferId?: string) {
-	const wrongPool = selection.orchestrators.filter((candidate) => candidate.prism_pool !== selection.preferredPool);
-	if (!selection.orchestrators.length || wrongPool.length > 0) {
+function assertRequiredPoolSelection(
+	selection: SelectionResult,
+	testMode: boolean,
+	transferId?: string,
+	requiredPool: AssignmentPool = requiredPoolForTransfer(testMode),
+) {
+	const wrongPool = selection.orchestrators.filter((candidate) => candidate.prism_pool !== requiredPool);
+	if (!selection.orchestrators.length || selection.preferredPool !== requiredPool || wrongPool.length > 0) {
 		const transferClass = testMode ? "test" : "production";
-
-		throw new Error(`no ready ${selection.preferredPool} orchestrators available for ${transferClass} transfers`);
+		logger.error(
+			{
+				transferId,
+				testMode,
+				preferredPool: requiredPool,
+				selectedPreferredPool: selection.preferredPool,
+				selectedCount: selection.orchestrators.length,
+				selectedPools: selection.orchestrators.map((candidate) => candidate.prism_pool),
+				wrongPoolCandidates: wrongPool.map(summarizeCandidate),
+				candidateCounts: selection.counts,
+			},
+			"assignment selection violated required pool restriction",
+		);
+		throw new Error(`no ready ${requiredPool} orchestrators available for ${transferClass} transfers`);
 	}
-}
-
-async function insertTransferAssignment(db: DbConn, slice: TransferAssignmentSlice): Promise<string> {
-	const [row] = await db<{ id: string }[]>`
-    INSERT INTO core.transfer_assignments
-			(transfer_id, orchestrator_id, chunk_start, chunk_end, total_chunks, chunk_size, status, assigned_at)
-    VALUES
-      (${slice.transferId}, ${slice.orchestratorId}, ${slice.chunkStart}, ${slice.chunkEnd},
-			 ${slice.totalChunks}, ${slice.chunkSize}, 'assigned', NOW())
-		ON CONFLICT (transfer_id, orchestrator_id, chunk_start, chunk_end) DO UPDATE
-			SET total_chunks = EXCLUDED.total_chunks,
-				chunk_size = EXCLUDED.chunk_size,
-				status = 'assigned',
-				assigned_at = NOW()
-    RETURNING id
-  `;
-
-	return row!.id;
-}
-
-async function persistAssignmentFailure(
-	db: DbConn,
-	input: {
-		assignmentId?: string | null;
-		transferId: string;
-		orchestratorId: string;
-		chunkStart: number;
-		chunkEnd: number;
-		totalChunks: number;
-		failureType: AssignmentFailureType;
-		reason: string;
-	},
-): Promise<void> {
-	await db`
-    INSERT INTO core.orchestrator_assignment_failures
-      (assignment_id, transfer_id, orchestrator_id, chunk_start, chunk_end, total_chunks, failure_type, reason)
-    VALUES
-      (${input.assignmentId ?? null}, ${input.transferId}, ${input.orchestratorId}, ${input.chunkStart}, ${input.chunkEnd}, ${input.totalChunks}, ${input.failureType}, ${input.reason})
-  `;
 }
 
 export class AssignmentEngine {
 	private readonly db: Db;
 	private readonly gatewayClient: WorkerGatewayClient;
+	private readonly offerRegistry: TransferRuntimeRegistry;
+	private readonly routingRegistry: OrchestratorRoutingRegistry;
 
 	constructor(deps: AssignmentEngineDeps) {
 		this.db = deps.db;
 		this.gatewayClient = deps.gatewayClient;
+		this.offerRegistry = deps.offerRegistry;
+		this.routingRegistry = deps.routingRegistry;
 	}
 
-	private async failTransferAssignment(transferId: string, reason: string): Promise<void> {
-		await this.db`
-			UPDATE core.transfers
-			SET status = 'failed',
-					error_message = ${reason},
-					completed_at = COALESCE(completed_at, NOW())
-			WHERE id = ${transferId}
-				AND status NOT IN ('completed', 'failed', 'cancelled')
-		`;
+	private failTransferAssignment(transferId: string, reason: string): void {
+		this.offerRegistry.failTransfer(transferId, reason);
 	}
 
-	private async markTransferInProgress(sql: DbConn, transferId: string): Promise<void> {
-		const rows = await sql<{ id: string }[]>`
-			UPDATE core.transfers
-			SET status = 'in_progress',
-				started_at = COALESCE(started_at, NOW())
-			WHERE id = ${transferId}
-				AND status IN ('pending', 'planning')
-			RETURNING id
-		`;
-		if (!rows.length) {
-			throw new Error(`transfer ${transferId} not found or not assignable`);
+	private registerRuntimeAssignments(input: {
+		transferId: string;
+		totalBytes: number;
+		totalChunks: number;
+		chunkSize: number;
+		metadata: unknown;
+		pendingPushes: PendingAssignmentPush[];
+	}): boolean {
+		const result = this.offerRegistry.createAssignments(
+			input.pendingPushes.map((push) => ({
+				assignmentId: push.assignmentId,
+				transferId: input.transferId,
+				orchestratorId: push.orchestrator.id,
+				orchestratorHotkey: push.orchestrator.hotkey,
+				workerGatewayType: push.orchestrator.gateway_type,
+				workerGatewayUrl: push.orchestrator.gateway_url,
+				chunkStart: push.chunkStart,
+				chunkEnd: push.chunkEnd,
+				totalChunks: push.totalChunks,
+				totalBytes: input.totalBytes,
+				chunkSize: input.chunkSize,
+				metadata: input.metadata,
+			})),
+		);
+		if (!result.ok) {
+			logger.warn(
+				{ transferId: input.transferId, reason: result.reason, assignmentCount: input.pendingPushes.length },
+				"runtime assignment registration failed",
+			);
 		}
+		return result.ok;
 	}
 
-	private async loadCumulativeRecoveryExclusions(
-		sql: DbConn,
-		input: {
-			transferId: string;
-			chunkIndices: number[];
-			excludeOrchestratorIds: string[];
-		},
-	): Promise<{ orchestratorIds: string[]; ownerGroupIds: string[] }> {
-		const rows = await sql<{ id: string; owner_group_id: string | null }[]>`
-			WITH bundled(chunk_index) AS (
-				SELECT unnest(${input.chunkIndices}::int[])
-			),
-			previous_orchestrators AS (
-				SELECT unnest(${input.excludeOrchestratorIds}::uuid[]) AS orchestrator_id
-				UNION
-				SELECT t.orchestrator_id
-				FROM core.tasks t
-				JOIN bundled b ON b.chunk_index = t.chunk_index
-				WHERE t.transfer_id = ${input.transferId}
-					AND t.orchestrator_id IS NOT NULL
-					AND t.state NOT IN ('completed', 'cancelled')
-				UNION
-				SELECT i.orchestrator_id
-				FROM core.orchestrator_guardrail_interventions i
-				JOIN core.tasks t ON t.id = i.task_id
-				JOIN bundled b ON b.chunk_index = t.chunk_index
-				WHERE t.transfer_id = ${input.transferId}
-					AND i.outcome IN ('stall_redistributed', 'missing_coverage_assigned')
-				UNION
-				SELECT f.orchestrator_id
-				FROM core.orchestrator_assignment_failures f
-				JOIN bundled b ON b.chunk_index BETWEEN f.chunk_start AND f.chunk_end
-				WHERE f.transfer_id = ${input.transferId}
-			)
-			SELECT DISTINCT o.id, o.owner_group_id
-			FROM core.orchestrators o
-			JOIN previous_orchestrators p ON p.orchestrator_id = o.id
-		`;
-		const activeStallOwners = await sql<{ orchestrator_id: string }[]>`
-			WITH bundled(chunk_index) AS (
-				SELECT unnest(${input.chunkIndices}::int[])
-			)
-			SELECT DISTINCT t.orchestrator_id
-			FROM core.tasks t
-			JOIN bundled b ON b.chunk_index = t.chunk_index
-			WHERE t.transfer_id = ${input.transferId}
-				AND t.orchestrator_id IS NOT NULL
-				AND t.state NOT IN ('completed', 'cancelled')
-		`;
-		const speeds = await this.loadTransferOrchestratorSpeeds(sql, input.transferId);
-		const ownerGroupIdsByOrch = new Map(rows.map((row) => [row.id, row.owner_group_id]));
-		return applyHotOrchestratorCarveOut({
-			excludedOrchestratorIds: [...new Set(rows.map((row) => row.id))],
-			ownerGroupIdsByOrch,
-			speeds: this.toCarveOutSpeeds(speeds),
-			activeStallOwnerIds: new Set(activeStallOwners.map((row) => row.orchestrator_id)),
-		});
+	private registerTransferStarted(input: {
+		transferId: string;
+		totalBytes: number;
+		totalChunks: number;
+		chunkSize: number;
+		metadata: unknown;
+	}): void {
+		this.offerRegistry.registerTransferStarted(input);
 	}
 
-	private async loadTransferOrchestratorSpeeds(
-		sql: DbConn,
-		transferId: string,
-	): Promise<TransferOrchestratorSpeed[]> {
-		return sql<TransferOrchestratorSpeed[]>`
-			SELECT
-				t.orchestrator_id,
-				percentile_cont(0.5) WITHIN GROUP (
-					ORDER BY extract(epoch FROM (t.completed_at - t.started_at))
-				) FILTER (WHERE t.started_at IS NOT NULL)::float8 AS median_relay_s,
-				MAX(t.completed_at) AS last_completed_at,
-				count(*)::int AS completed_count
-			FROM core.tasks t
-			WHERE t.transfer_id = ${transferId}
-				AND t.state = 'completed'
-				AND t.completed_at > NOW() - (${TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS} * INTERVAL '1 second')
-				AND t.orchestrator_id IS NOT NULL
-			GROUP BY t.orchestrator_id
-		`;
+	private loadCumulativeRecoveryExclusions(input: {
+		transferId: string;
+		chunkIndices: number[];
+		excludeOrchestratorIds: string[];
+	}): { orchestratorIds: string[]; ownerGroupIds: string[] } {
+		return this.offerRegistry.getRecoveryExclusions(
+			input.transferId,
+			input.chunkIndices,
+			input.excludeOrchestratorIds,
+			this.routingRegistry,
+		);
+	}
+
+	private loadTransferOrchestratorSpeeds(transferId: string): TransferOrchestratorSpeed[] {
+		return this.offerRegistry.getRecoveryOrchestratorSpeeds(transferId, env.TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS);
 	}
 
 	private toCarveOutSpeeds(speeds: TransferOrchestratorSpeed[]) {
@@ -1011,8 +1657,7 @@ export class AssignmentEngine {
 			}));
 	}
 
-	private async selectOrchestrators(
-		sql: DbConn,
+	private selectOrchestrators(
 		testMode: boolean,
 		excludeIds: string[] = [],
 		orderSeed?: string,
@@ -1024,30 +1669,19 @@ export class AssignmentEngine {
 			excludeOwnerGroupIds?: string[];
 			recoveryChunkCount?: number;
 			recoverySpeeds?: TransferOrchestratorSpeed[];
+			requiredPool?: AssignmentPool;
 		} = {},
-	): Promise<SelectionResult> {
-		const preferredPool = testMode ? "qualifying" : "qualified";
+	): SelectionResult {
+		const transferPool = requiredPoolForTransfer(testMode);
+		const preferredPool = options.requiredPool ?? transferPool;
+		if (preferredPool !== transferPool) {
+			throw new Error(`transfer pool mismatch: expected ${transferPool}, received ${preferredPool}`);
+		}
 		const excludeOwnerGroupIds = options.excludeOwnerGroupIds ?? [];
 
-		const allCandidates = await sql<OrchestratorCandidate[]>`
-      SELECT
-        o.id,
-        o.hotkey,
-		g.type                          AS gateway_type,
-		g.url                          AS gateway_url,
-        o.uid                          AS uid,
-        o.prism_final_score            AS prism_final_score,
-        o.prism_confidence_score       AS prism_confidence_score,
-        o.prism_pool                   AS prism_pool,
-        o.owner_group_id               AS owner_group_id
-      FROM core.orchestrators o
-		LEFT JOIN core.gateways g ON g.id = o.gateway_id
-			WHERE o.ready = TRUE
-        AND (${excludeIds.length} = 0 OR o.id != ALL(${excludeIds}))
-        AND (${excludeOwnerGroupIds.length} = 0 OR o.owner_group_id IS NULL OR o.owner_group_id != ALL(${excludeOwnerGroupIds}))
-    `;
+		const allCandidates = this.routingRegistry.listReadyCandidates(excludeIds, excludeOwnerGroupIds);
 
-		const websocketReady = allCandidates.filter((candidate) => isEligible(candidate.hotkey));
+		const websocketReady = allCandidates.filter((candidate) => orchestratorIsEligible(candidate.hotkey));
 		const eligible = websocketReady;
 		const connectedRegistry = connectedHotkeys().sort((left, right) => left.localeCompare(right));
 		const queriedHotkeys = allCandidates.map((candidate) => candidate.hotkey);
@@ -1066,8 +1700,7 @@ export class AssignmentEngine {
 
 		if (options.recoverySelection && options.transferId) {
 			const speeds =
-				options.recoverySpeeds ??
-				(await this.loadTransferOrchestratorSpeeds(sql, options.transferId));
+				options.recoverySpeeds ?? this.loadTransferOrchestratorSpeeds(options.transferId);
 			const speedByOrch = new Map(speeds.map((row) => [row.orchestrator_id, row]));
 			const hasRelaySpeed = (candidate: OrchestratorCandidate): boolean => {
 				const stat = speedByOrch.get(candidate.id);
@@ -1134,8 +1767,8 @@ export class AssignmentEngine {
 						a.hotkey.localeCompare(b.hotkey) ||
 						a.id.localeCompare(b.id),
 				);
-				const ratio = QUALIFIED_WINDOW_RATIO;
-				const minW = MIN_QUALIFIED_WINDOW_SIZE;
+				const ratio = env.QUALIFIED_WINDOW_RATIO;
+				const minW = env.MIN_QUALIFIED_WINDOW_SIZE;
 				const competitionWindowSize = computeQualifiedCompetitionWindowSize(logicalTotalChunks, n, ratio, minW);
 				const nn = BigInt(n);
 				const cursorBeforeMod = qualifiedRingCursorLocked % nn;
@@ -1168,7 +1801,21 @@ export class AssignmentEngine {
 
 		if (!preferred.length) {
 			const transferClass = testMode ? "test" : "production";
-
+			logger.warn(
+				{
+					testMode,
+					preferredPool,
+					excludeIds,
+					candidateCounts: counts,
+					diagnostics: {
+						queriedHotkeys,
+						websocketReadyHotkeys,
+						missingWebsocketHotkeys,
+						connectedRegistryHotkeys: connectedRegistry,
+					},
+				},
+				"no eligible orchestrators available in required pool for assignment",
+			);
 			throw new Error(`no ready ${preferredPool} orchestrators available for ${transferClass} transfers`);
 		}
 
@@ -1202,20 +1849,8 @@ export class AssignmentEngine {
 				: plan;
 		await sql`
 			INSERT INTO core.transfer_assignment_plans (transfer_id, pool, plan)
-			VALUES (${transferId}, ${pool}, ${JSON.stringify(storablePlan as never)})
+			VALUES (${transferId}, ${pool}, ${sql.json(storablePlan as never)})
 		`;
-		if (pool === "qualified") {
-			const orchestratorIds = [...new Set(plan.deliveries.map((delivery) => delivery.orchestratorId))];
-			if (orchestratorIds.length > 0) {
-				await sql`
-					UPDATE core.orchestrators
-					SET prism_pool_transition_pending = FALSE,
-						updated_at = NOW()
-					WHERE id = ANY(${orchestratorIds}::uuid[])
-						AND prism_pool_transition_pending = TRUE
-				`;
-			}
-		}
 	}
 
 	private async assignChunkCoverage(input: {
@@ -1252,30 +1887,28 @@ export class AssignmentEngine {
 			const { orchestrator, sliceSize } = coveragePairs[pairCursor]!;
 			pairCursor += 1;
 
-			const chunkStart = remainingChunkStart;
-			const chunkEnd = remainingChunkStart + sliceSize - 1;
-			const assignmentId = await insertTransferAssignment(input.sql, {
-				transferId: input.transferId,
-				orchestratorId: orchestrator.id,
-				chunkStart,
-				chunkEnd,
-				totalChunks: sliceSize,
-				chunkSize: input.chunkSize,
-			});
+			let sliceRemaining = sliceSize;
+			while (sliceRemaining > 0) {
+				const batchSize = Math.min(sliceRemaining, env.TRANSFER_TASK_OFFER_BATCH_SIZE);
+				const chunkStart = remainingChunkStart;
+				const chunkEnd = remainingChunkStart + batchSize - 1;
+				const assignmentId = randomUUID();
 
-			assignmentIds.push(assignmentId);
-			pendingPushes.push({
-				assignmentId,
-				orchestrator,
-				chunkStart,
-				chunkEnd,
-				totalChunks: sliceSize,
-				chunkSize: input.chunkSize,
-			});
-			assignedChunkCount += sliceSize;
-			assignmentSlices.push(summarizeAssignmentSlice(orchestrator, chunkStart, chunkEnd, sliceSize));
-			remainingChunkStart += sliceSize;
-			remainingChunks -= sliceSize;
+				assignmentIds.push(assignmentId);
+				pendingPushes.push({
+					assignmentId,
+					orchestrator,
+					chunkStart,
+					chunkEnd,
+					totalChunks: batchSize,
+					chunkSize: input.chunkSize,
+				});
+				assignedChunkCount += batchSize;
+				assignmentSlices.push(summarizeAssignmentSlice(orchestrator, chunkStart, chunkEnd, batchSize));
+				remainingChunkStart += batchSize;
+				remainingChunks -= batchSize;
+				sliceRemaining -= batchSize;
+			}
 		}
 
 		return {
@@ -1287,44 +1920,110 @@ export class AssignmentEngine {
 		};
 	}
 
-	private async dispatchAssignmentPushes(
+	private async deliverTaskOfferBatchWithRetry(
 		transferId: string,
-		metadata: TransferMetadata | null,
+		push: PendingAssignmentPush,
+	): Promise<boolean> {
+		for (let attempt = 1; attempt <= env.WS_ASSIGNMENT_PUSH_RETRY_ATTEMPTS; attempt += 1) {
+			const result = await deliverTaskOfferBatchForAssignment({
+				gatewayClient: this.gatewayClient,
+				batchId: push.assignmentId,
+				expectedOrchestratorId: push.orchestrator.id,
+				offerRegistry: this.offerRegistry,
+			});
+			if (result.ok) {
+				recordWsPushResult(transferId, true);
+				return true;
+			}
+			logger.warn(
+				{
+					transferId,
+					batchId: push.assignmentId,
+					hotkey: push.orchestrator.hotkey,
+					attempt,
+					code: result.code,
+					message: result.message,
+				},
+				"task offer batch delivery attempt failed",
+			);
+			if (attempt < env.WS_ASSIGNMENT_PUSH_RETRY_ATTEMPTS) {
+				await sleepMs(50 * attempt);
+			}
+		}
+
+		recordWsPushResult(transferId, false);
+		await this.expireTransferAssignment({
+			assignmentId: push.assignmentId,
+			reason: "websocket_not_ready_or_push_rejected",
+		});
+		this.offerRegistry.recordOverseerIntervention({
+			interventionType: "assignment_push_failed",
+			assignmentId: push.assignmentId,
+			transferId,
+			orchestratorId: push.orchestrator.id,
+			chunkStart: push.chunkStart,
+			chunkEnd: push.chunkEnd,
+			totalChunks: push.totalChunks,
+			outcome: "ws_push_failed",
+			reason: "websocket_not_ready_or_push_rejected",
+			metadata: { delivery_attempts: env.WS_ASSIGNMENT_PUSH_RETRY_ATTEMPTS },
+		});
+		logger.warn(
+			{
+				transferId,
+				assignmentId: push.assignmentId,
+				hotkey: push.orchestrator.hotkey,
+				chunkStart: push.chunkStart,
+			chunkEnd: push.chunkEnd,
+			attempts: env.WS_ASSIGNMENT_PUSH_RETRY_ATTEMPTS,
+		},
+			"task offer batch delivery failed after assignment commit",
+		);
+		return false;
+	}
+
+	private async dispatchTaskOfferBatches(
+		transferId: string,
 		pushes: PendingAssignmentPush[],
 	): Promise<void> {
-		const destinationUrl = extractDestinationUrl(metadata);
-		await Promise.all(
-			pushes.map(async (push) => {
-				const pushed = pushToOrchestrator(push.orchestrator.hotkey, {
-					type: "transfer_assigned",
-					assignment_id: push.assignmentId,
-					transfer_id: transferId,
-					chunk_start: push.chunkStart,
-					chunk_end: push.chunkEnd,
-					total_chunks: push.totalChunks,
-					chunk_size: push.chunkSize,
-					gateway_url:
-						workerGatewayUrlForType(push.orchestrator.gateway_type, push.orchestrator.gateway_url),
-					destination_url: destinationUrl,
-				});
-				if (pushed) return;
-				await this.expireTransferAssignment({
-					assignmentId: push.assignmentId,
-					reason: "websocket_not_ready_or_push_rejected",
-				});
-				await persistAssignmentFailure(this.db, {
-					assignmentId: push.assignmentId,
-					transferId,
-					orchestratorId: push.orchestrator.id,
-					chunkStart: push.chunkStart,
-					chunkEnd: push.chunkEnd,
-					totalChunks: push.totalChunks,
-					failureType: "ws_push_failed",
-					reason: "websocket_not_ready_or_push_rejected",
-				});
+		const concurrency = env.WS_ASSIGNMENT_PUSH_RETRY_CONCURRENCY;
+		for (let offset = 0; offset < pushes.length; offset += concurrency) {
+			const batch = pushes.slice(offset, offset + concurrency);
+			await Promise.all(batch.map((push) => this.deliverTaskOfferBatchWithRetry(transferId, push)));
+		}
+	}
 
-			}),
-		);
+	async resendTaskOfferBatchFromRegistry(assignmentId: string): Promise<boolean> {
+		const assignment = this.offerRegistry.getAssignment(assignmentId);
+		if (!assignment || assignment.status !== "assigned") {
+			return false;
+		}
+		const pushed = await this.deliverTaskOfferBatchWithRetry(assignment.transferId, {
+			assignmentId: assignment.assignmentId,
+			orchestrator: {
+				id: assignment.orchestratorId,
+				hotkey: assignment.orchestratorHotkey,
+				uid: null,
+				owner_group_id: null,
+				gateway_type: assignment.workerGatewayType,
+				gateway_url: assignment.workerGatewayUrl,
+				prism_final_score: "0",
+				prism_confidence_score: "0",
+				prism_pool: "qualified",
+			},
+			chunkStart: assignment.chunkStart,
+			chunkEnd: assignment.chunkEnd,
+			totalChunks: assignment.totalChunks,
+			chunkSize: assignment.chunkSize,
+		});
+		if (pushed) {
+			recordResendPush(assignment.transferId);
+		}
+		return pushed;
+	}
+
+	async resendAssignmentPush(assignmentId: string): Promise<boolean> {
+		return this.resendTaskOfferBatchFromRegistry(assignmentId);
 	}
 
 	async reassignStalledChunkBundle(input: {
@@ -1334,7 +2033,8 @@ export class AssignmentEngine {
 		reason: string;
 		staleAssignmentIds?: string[];
 	}): Promise<ReassignChunkBundleResult> {
-		const chunkIndices = [...new Set(input.chunkIndices)].sort((a, b) => a - b);
+		const requestedChunks = [...new Set(input.chunkIndices)].sort((a, b) => a - b);
+		const chunkIndices = this.offerRegistry.filterRecoverableChunkIndices(input.transferId, requestedChunks);
 		const empty: ReassignChunkBundleResult = {
 			ok: true,
 			assignmentIds: [],
@@ -1343,17 +2043,67 @@ export class AssignmentEngine {
 		};
 		if (!chunkIndices.length) return empty;
 
-		const transfers = await this.db<{ chunk_size: number; metadata: unknown; total_chunks: number }[]>`
-			SELECT chunk_size, metadata, total_chunks FROM core.transfers WHERE id = ${input.transferId} LIMIT 1
-			`;
-		const transfer = transfers[0];
-		if (!transfer) {
-			throw new Error(`transfer ${input.transferId} not found`);
+		const transferRecord = this.offerRegistry.getTransferRecord(input.transferId);
+		if (!transferRecord) {
+			throw new Error(`transfer ${input.transferId} not found in runtime registry`);
 		}
 
-		const metadata = parseTransferMetadata(transfer.metadata);
+		if (input.staleAssignmentIds?.length) {
+			for (const assignmentId of input.staleAssignmentIds) {
+				const assignment = this.offerRegistry.getAssignment(assignmentId);
+				if (!assignment) {
+					continue;
+				}
+				const overlaps = chunkIndices.some(
+					(index) => index >= assignment.chunkStart && index <= assignment.chunkEnd,
+				);
+				if (!overlaps) {
+					continue;
+				}
+				const restartRecovered = this.offerRegistry.isRestartRecoveredAssignment(assignment.assignmentId);
+				const reason = restartRecovered
+					? "control_plane_restart"
+					: "assignment_produced_no_tasks_before_timeout";
+				const outcome = restartRecovered
+					? "zero_task_assignment_requeued_after_restart"
+					: "stale_assignment_timeout";
+				this.offerRegistry.recordOverseerIntervention({
+					interventionType: restartRecovered
+						? "control_plane_restart_recovery"
+						: "assignment_stale_timeout",
+					transferId: input.transferId,
+					assignmentId: assignment.assignmentId,
+					orchestratorId: assignment.orchestratorId,
+					chunkStart: assignment.chunkStart,
+					chunkEnd: assignment.chunkEnd,
+					totalChunks: assignment.totalChunks,
+					outcome,
+					reason,
+					...(restartRecovered
+						? {
+								metadata: {
+									recovery_origin: "control_plane_restart",
+									prism_countable: false,
+								},
+							}
+						: {}),
+				});
+				this.offerRegistry.recordRecoveryOutcomeForRange({
+					transferId: input.transferId,
+					chunkStart: assignment.chunkStart,
+					chunkEnd: assignment.chunkEnd,
+					assignmentId: assignment.assignmentId,
+					orchestratorId: assignment.orchestratorId,
+					reason,
+					outcome: restartRecovered ? "zero_task_assignment_requeued_after_restart" : "orch_zero_tasks",
+				});
+			}
+		}
+
+		const metadata = parseTransferMetadata(transferRecord.metadata);
 		const testMode = Boolean(metadata?.test_mode);
-		const transferTotalChunks = transfer.total_chunks;
+		const recoveryPool = requiredPoolForTransfer(testMode);
+		const transferTotalChunks = transferRecord.totalChunks;
 		const batchChunkCount = chunkIndices.length;
 
 		type BundleOk = {
@@ -1365,47 +2115,35 @@ export class AssignmentEngine {
 			partial: boolean;
 			assignedChunkCount: number;
 			remainingChunkCount: number;
+			chunksToAssign: number[];
+			interventionInputs: Array<{
+				task_id: string;
+				orchestrator_id: string;
+				previous_worker_id: string | null;
+				chunk_index: number;
+				reason: string;
+				outcome: string;
+			}>;
 		};
 		type BundleBusy = {
 			ok: false;
 			kind: "no_orchs" | "partial_coverage";
 		};
 
-		const tryBundleSql = async (sql: DbConn): Promise<BundleOk | BundleBusy> => {
-			if (input.staleAssignmentIds?.length) {
-				await sql`
-					INSERT INTO core.orchestrator_assignment_failures
-						(assignment_id, transfer_id, orchestrator_id, chunk_start, chunk_end, total_chunks, failure_type, reason)
-					SELECT
-						ta.id,
-						ta.transfer_id,
-						ta.orchestrator_id,
-						ta.chunk_start,
-						ta.chunk_end,
-						ta.total_chunks,
-						'stale_assignment_timeout',
-						'assignment_produced_no_tasks_before_timeout'
-					FROM core.transfer_assignments ta
-					WHERE ta.id = ANY(${input.staleAssignmentIds})
-						AND EXISTS (
-							SELECT 1
-							FROM unnest(${chunkIndices}::int[]) AS bundled(chunk_index)
-							WHERE bundled.chunk_index BETWEEN ta.chunk_start AND ta.chunk_end
-						)
-				`;
-			}
-
-			const recoverySpeeds = await this.loadTransferOrchestratorSpeeds(sql, input.transferId);
+		const tryBundle = async (): Promise<BundleOk | BundleBusy> => {
+			const recoverySpeeds = this.loadTransferOrchestratorSpeeds(input.transferId);
+			const cumulativeExclusions =
+				input.reason === "missing_chunk_coverage"
+					? { orchestratorIds: input.excludeOrchestratorIds, ownerGroupIds: [] }
+					: this.loadCumulativeRecoveryExclusions({
+							transferId: input.transferId,
+							chunkIndices,
+							excludeOrchestratorIds: input.excludeOrchestratorIds,
+						});
 
 			let selection: SelectionResult;
-			const cumulativeExclusions = await this.loadCumulativeRecoveryExclusions(sql, {
-				transferId: input.transferId,
-				chunkIndices,
-				excludeOrchestratorIds: input.excludeOrchestratorIds,
-			});
 			try {
-				selection = await this.selectOrchestrators(
-					sql,
+				selection = this.selectOrchestrators(
 					testMode,
 					cumulativeExclusions.orchestratorIds,
 					input.transferId,
@@ -1417,9 +2155,10 @@ export class AssignmentEngine {
 						recoveryChunkCount: batchChunkCount,
 						recoverySpeeds,
 						excludeOwnerGroupIds: cumulativeExclusions.ownerGroupIds,
+						requiredPool: recoveryPool,
 					},
 				);
-				assertRequiredPoolSelection(selection, testMode, input.transferId);
+				assertRequiredPoolSelection(selection, testMode, input.transferId, recoveryPool);
 			} catch {
 				return { ok: false, kind: "no_orchs" };
 			}
@@ -1448,60 +2187,48 @@ export class AssignmentEngine {
 			if (!virtualRows.length) {
 				return { ok: false, kind: "no_orchs" };
 			}
+			const batchRows = virtualRows.flatMap((row) => {
+				const rows: VirtualAssignmentRow[] = [];
+				let chunkStart = row.chunkStart;
+				let remaining = row.totalChunks;
+				while (remaining > 0) {
+					const batchSize = Math.min(remaining, env.TRANSFER_TASK_OFFER_BATCH_SIZE);
+					rows.push({
+						orchestrator: row.orchestrator,
+						chunkStart,
+						chunkEnd: chunkStart + batchSize - 1,
+						totalChunks: batchSize,
+					});
+					chunkStart += batchSize;
+					remaining -= batchSize;
+				}
+				return rows;
+			});
 
-			await sql`
-				UPDATE core.transfer_assignments
-				SET status = 'expired',
-					completed_at = COALESCE(completed_at, NOW())
-				WHERE transfer_id = ${input.transferId}
-					AND status NOT IN ('completed', 'failed', 'expired')
-					AND EXISTS (
-						SELECT 1
-						FROM unnest(${chunksToAssign}::int[]) AS bundled(chunk_index)
-						WHERE bundled.chunk_index BETWEEN chunk_start AND chunk_end
-					)
-			`;
+			const tasksBefore: BundleTaskBefore[] = this.offerRegistry
+				.getActiveTasksForChunks(input.transferId, chunksToAssign)
+				.map((task) => ({
+					id: task.taskId,
+					chunk_index: task.chunkIndex,
+					orchestrator_id: task.orchestratorId ?? "",
+					assigned_worker_id: task.workerId,
+				}));
 
-			const tasksBefore = await sql<BundleTaskBefore[]>`
-				SELECT id, chunk_index, orchestrator_id, assigned_worker_id
-				FROM core.tasks
-				WHERE transfer_id = ${input.transferId}
-					AND chunk_index = ANY(${chunksToAssign})
-					AND state NOT IN ('completed', 'cancelled')
-				FOR UPDATE
-			`;
-
-			const assignmentInputs = virtualRows.map((row) => ({
+			const assignmentInputs = batchRows.map((row) => ({
+				id: randomUUID(),
 				transfer_id: input.transferId,
 				orchestrator_id: row.orchestrator.id,
 				chunk_start: row.chunkStart,
 				chunk_end: row.chunkEnd,
 				total_chunks: row.totalChunks,
-				chunk_size: transfer.chunk_size,
+				chunk_size: transferRecord.chunkSize,
 			}));
-			const insertedAssignments = await sql<InsertedAssignmentRow[]>`
-				WITH input_rows AS (
-					SELECT *
-					FROM jsonb_to_recordset(${JSON.stringify(assignmentInputs)}::jsonb) AS r(
-						transfer_id uuid,
-						orchestrator_id uuid,
-						chunk_start int,
-						chunk_end int,
-						total_chunks int,
-						chunk_size int
-					)
-				)
-				INSERT INTO core.transfer_assignments
-					(transfer_id, orchestrator_id, chunk_start, chunk_end, total_chunks, chunk_size, status, assigned_at)
-				SELECT transfer_id, orchestrator_id, chunk_start, chunk_end, total_chunks, chunk_size, 'assigned', NOW()
-				FROM input_rows
-				ON CONFLICT (transfer_id, orchestrator_id, chunk_start, chunk_end) DO UPDATE
-					SET total_chunks = EXCLUDED.total_chunks,
-						chunk_size = EXCLUDED.chunk_size,
-						status = 'assigned',
-						assigned_at = NOW()
-				RETURNING id, orchestrator_id, chunk_start, chunk_end
-			`;
+			const insertedAssignments: InsertedAssignmentRow[] = assignmentInputs.map((row) => ({
+				id: row.id,
+				orchestrator_id: row.orchestrator_id,
+				chunk_start: row.chunk_start,
+				chunk_end: row.chunk_end,
+			}));
 			const assignmentByKey = new Map(
 				insertedAssignments.map((row) => [
 					`${row.orchestrator_id}:${row.chunk_start}:${row.chunk_end}`,
@@ -1512,7 +2239,7 @@ export class AssignmentEngine {
 			const assignmentSlices: AssignmentCoverageResult["assignmentSlices"] = [];
 			const pendingPushes: PendingAssignmentPush[] = [];
 			const chunkOwners = new Map<number, { assignmentId: string; orchestratorId: string }>();
-			for (const row of virtualRows) {
+			for (const row of batchRows) {
 				const inserted = assignmentByKey.get(`${row.orchestrator.id}:${row.chunkStart}:${row.chunkEnd}`);
 				if (!inserted) continue;
 				assignmentSlices.push(summarizeAssignmentSlice(row.orchestrator, row.chunkStart, row.chunkEnd, row.totalChunks));
@@ -1522,7 +2249,7 @@ export class AssignmentEngine {
 					chunkStart: row.chunkStart,
 					chunkEnd: row.chunkEnd,
 					totalChunks: row.totalChunks,
-					chunkSize: transfer.chunk_size,
+					chunkSize: transferRecord.chunkSize,
 				});
 				for (let chunkIndex = row.chunkStart; chunkIndex <= row.chunkEnd; chunkIndex++) {
 					if (chunksToAssign.includes(chunkIndex)) {
@@ -1534,76 +2261,20 @@ export class AssignmentEngine {
 				}
 			}
 			const outcome = interventionOutcomeForReason(input.reason);
-			const ownerInputs = [...chunkOwners.entries()].map(([chunkIndex, owner]) => ({
-				chunk_index: chunkIndex,
-				assignment_id: owner.assignmentId,
-				orchestrator_id: owner.orchestratorId,
-			}));
 			const interventionInputs = tasksBefore.flatMap((task) => {
 				const owner = chunkOwners.get(task.chunk_index);
 				if (!owner) return [];
 				return [
 					{
 						task_id: task.id,
-						transfer_id: input.transferId,
 						orchestrator_id: task.orchestrator_id,
 						previous_worker_id: task.assigned_worker_id,
+						chunk_index: task.chunk_index,
 						reason: input.reason,
 						outcome,
 					},
 				];
 			});
-			if (interventionInputs.length) {
-				await sql`
-					INSERT INTO core.orchestrator_guardrail_interventions
-						(task_id, transfer_id, orchestrator_id, previous_worker_id, replacement_worker_id,
-						 intervention_type, reason, outcome)
-					SELECT
-						task_id,
-						transfer_id,
-						orchestrator_id,
-						previous_worker_id,
-						NULL::varchar,
-						'beamcore_overseer_recovery',
-						reason,
-						outcome
-					FROM jsonb_to_recordset(${JSON.stringify(interventionInputs)}::jsonb) AS r(
-						task_id uuid,
-						transfer_id uuid,
-						orchestrator_id uuid,
-						previous_worker_id varchar,
-						reason text,
-						outcome varchar
-					)
-				`;
-			}
-			if (ownerInputs.length) {
-				await sql`
-					WITH owners AS (
-						SELECT *
-						FROM jsonb_to_recordset(${JSON.stringify(ownerInputs)}::jsonb) AS o(
-							chunk_index int,
-							assignment_id uuid,
-							orchestrator_id uuid
-						)
-					)
-					UPDATE core.tasks t
-					SET assignment_id = owners.assignment_id,
-						orchestrator_id = owners.orchestrator_id,
-						assigned_worker_id = NULL,
-						state = 'pending',
-						offered_at = NULL,
-						accepted_at = NULL,
-						started_at = NULL,
-						failed_at = NULL,
-						failure_reason = NULL,
-						current_attempt_id = NULL
-					FROM owners
-					WHERE t.transfer_id = ${input.transferId}
-						AND t.chunk_index = owners.chunk_index
-						AND t.state NOT IN ('completed', 'cancelled')
-				`;
-			}
 
 			return {
 				ok: true,
@@ -1614,12 +2285,64 @@ export class AssignmentEngine {
 				partial,
 				assignedChunkCount: assignableCount,
 				remainingChunkCount: batchChunkCount - assignableCount,
+				chunksToAssign,
+				interventionInputs,
 			};
 		};
 
 		const finishOk = (result: BundleOk): ReassignChunkBundleResult => {
-			void this.dispatchAssignmentPushes(input.transferId, metadata, result.pendingPushes).catch((err: unknown) => {
-
+			for (const intervention of result.interventionInputs) {
+				this.offerRegistry.recordOverseerIntervention({
+					interventionType: "task_recovery",
+					transferId: input.transferId,
+					taskId: intervention.task_id,
+					orchestratorId: intervention.orchestrator_id,
+					previousWorkerId: intervention.previous_worker_id,
+					chunkIndex: intervention.chunk_index,
+					reason: intervention.reason,
+					outcome: intervention.outcome,
+				});
+			}
+			const recoveryChunks = result.chunksToAssign.filter(
+				(index) => !this.offerRegistry.isChunkIndexCompleted(input.transferId, index),
+			);
+			this.offerRegistry.expireAssignments(input.transferId, recoveryChunks, input.reason);
+			const registered = this.registerRuntimeAssignments({
+				transferId: input.transferId,
+				totalBytes: transferRecord.totalBytes,
+				totalChunks: transferTotalChunks,
+				chunkSize: transferRecord.chunkSize,
+				metadata: transferRecord.metadata,
+				pendingPushes: result.pendingPushes,
+			});
+			if (!registered) {
+				this.offerRegistry.recordRecoveryOutcomeForChunks({
+					transferId: input.transferId,
+					chunkIndices: recoveryChunks,
+					reason: input.reason,
+					outcome: "runtime_assignment_registration_failed",
+					countRecoveryAttempt: true,
+				});
+				return {
+					ok: false,
+					assignmentIds: [],
+					assignmentSlices: [],
+					pendingPushes: [],
+					kind: "partial_coverage",
+				};
+			}
+			for (const push of result.pendingPushes) {
+				this.offerRegistry.recordRecoveryAssignment({
+					transferId: input.transferId,
+					assignmentId: push.assignmentId,
+					orchestratorId: push.orchestrator.id,
+					chunkStart: push.chunkStart,
+					chunkEnd: push.chunkEnd,
+					reason: input.reason,
+				});
+			}
+			void this.dispatchTaskOfferBatches(input.transferId, result.pendingPushes).catch((err: unknown) => {
+				logger.error({ err, transferId: input.transferId }, "bundle reassignment dispatch failed");
 			});
 			return {
 				ok: true,
@@ -1633,166 +2356,65 @@ export class AssignmentEngine {
 			};
 		};
 
-		const result = await this.db.begin((sql) => tryBundleSql(sql));
+		const result = await tryBundle();
 		if (result.ok) {
 			return finishOk(result);
 		}
+		this.offerRegistry.recordRecoveryOutcomeForChunks({
+			transferId: input.transferId,
+			chunkIndices,
+			reason: input.reason,
+			outcome: (result as BundleBusy).kind,
+			countRecoveryAttempt: true,
+		});
 		return {
 			ok: false,
 			assignmentIds: [],
 			assignmentSlices: [],
 			pendingPushes: [],
-			kind: result.kind,
+			kind: (result as BundleBusy).kind,
 		};
 	}
 
-	async findStaleAssignmentBundles(transferIds?: string[]): Promise<StaleAssignmentBundle[]> {
-		const scopedTransferIds = transferIds?.length ? transferIds : null;
-		const stale = await this.db<
-			{
-				id: string;
-				transfer_id: string;
-				orchestrator_id: string;
-				chunk_start: number;
-				chunk_end: number;
-				total_chunks: number;
-				chunk_size: number;
-				metadata: unknown;
-			}[]
-		>`
-      SELECT
-        ta.id,
-        ta.transfer_id     AS transfer_id,
-        ta.orchestrator_id AS orchestrator_id,
-        ta.chunk_start     AS chunk_start,
-        ta.chunk_end       AS chunk_end,
-        ta.total_chunks    AS total_chunks,
-        ta.chunk_size      AS chunk_size,
-        t.metadata
-      FROM core.transfer_assignments ta
-      JOIN core.transfers t ON t.id = ta.transfer_id
-      WHERE ta.status = 'assigned'
-			AND ta.assigned_at < NOW() - (${ZERO_TASK_ASSIGNMENT_TIMEOUT_SECONDS} * INTERVAL '1 second')
-        AND NOT EXISTS (
-          SELECT 1 FROM core.tasks tk WHERE tk.assignment_id = ta.id
-        )
-				AND (
-					t.status IN ('planning', 'in_progress')
-					OR (
-						t.status = 'pending'
-						AND (
-							EXISTS (
-								SELECT 1
-								FROM core.tasks tk
-								WHERE tk.transfer_id = t.id
-							)
-							OR EXISTS (
-								SELECT 1
-								FROM core.transfer_assignments ta2
-								WHERE ta2.transfer_id = t.id
-							)
-						)
-					)
-				)
-				AND (
-					${scopedTransferIds}::uuid[] IS NULL
-					OR ta.transfer_id = ANY(${scopedTransferIds}::uuid[])
-				)
-    `;
-		if (!stale.length) return [];
-
-		const grouped = new Map<string, StaleAssignmentBundle>();
-		for (const assignment of stale) {
-			const chunkIndices = Array.from(
-				{ length: assignment.chunk_end - assignment.chunk_start + 1 },
-				(_, offset) => assignment.chunk_start + offset,
-			);
-			const entry: StaleAssignmentEntry = {
-				id: assignment.id,
-				orchestratorId: assignment.orchestrator_id,
-				chunkStart: assignment.chunk_start,
-				chunkEnd: assignment.chunk_end,
-			};
-			const bundle = grouped.get(assignment.transfer_id) ?? {
-				transferId: assignment.transfer_id,
-				chunkIndices: [],
-				excludeOrchestratorIds: [],
-				staleAssignmentIds: [],
-				staleAssignments: [],
-			};
-			bundle.chunkIndices.push(...chunkIndices);
-			bundle.excludeOrchestratorIds.push(assignment.orchestrator_id);
-			bundle.staleAssignmentIds.push(assignment.id);
-			bundle.staleAssignments.push(entry);
-			grouped.set(assignment.transfer_id, bundle);
-		}
-
-		return [...grouped.values()].map((bundle) => ({
-			transferId: bundle.transferId,
-			chunkIndices: [...new Set(bundle.chunkIndices)].sort((a, b) => a - b),
-			excludeOrchestratorIds: [...new Set(bundle.excludeOrchestratorIds)],
-			staleAssignmentIds: bundle.staleAssignmentIds,
-			staleAssignments: bundle.staleAssignments,
-		}));
-	}
-
-	async collectStaleAssignmentBundles(): Promise<StaleAssignmentBundle[]> {
-		return this.findStaleAssignmentBundles();
-	}
-
-	async redistributeStaleAssignments(): Promise<void> {
-		const bundles = await this.findStaleAssignmentBundles();
-		for (const bundle of bundles) {
-			const result = await this.reassignStalledChunkBundle({
-				transferId: bundle.transferId,
-				chunkIndices: bundle.chunkIndices,
-				excludeOrchestratorIds: bundle.excludeOrchestratorIds,
-				staleAssignmentIds: bundle.staleAssignmentIds,
-				reason: "stale_assignment_timeout",
-			});
-
-			if (result.ok) {
-
-				continue;
-			}
-
-			await this.db`
-				UPDATE core.transfer_assignments
-				SET assigned_at = NOW()
-				WHERE id = ANY(${bundle.staleAssignmentIds})
-			`;
-
-		}
-	}
-
 	async assignTransfer(transferId: string): Promise<string[]> {
-		const transfers = await this.db<
-			{
-				id: string;
-				total_chunks: number;
-				chunk_size: number;
-				metadata: unknown;
-			}[]
-		>`
-      SELECT id, total_chunks AS total_chunks, chunk_size AS chunk_size, metadata
-      FROM core.transfers
-      WHERE id = ${transferId} AND status IN ('pending', 'planning')
-      LIMIT 1
-    `;
-		const transfer = transfers[0];
-		if (!transfer) throw new Error(`transfer ${transferId} not found or not assignable`);
+		const existingSnapshot = this.offerRegistry.getTransferSnapshot(transferId);
+		if (existingSnapshot) {
+			return existingSnapshot.assignments.map((assignment) => assignment.assignmentId);
+		}
+
+		let transferRecord = this.offerRegistry.getTransferRecord(transferId);
+		if (!transferRecord) {
+			throw new Error(`transfer ${transferId} not found or not assignable in runtime registry`);
+		}
+
+		const registryMeta = parseTransferMetadata(transferRecord.metadata);
+		if (
+			registryMeta &&
+			isSignedUrlTransferVersion(registryMeta.transfer_version) &&
+			!((registryMeta.chunk_routes as unknown[] | undefined) ?? []).length
+		) {
+			throw new Error(`transfer ${transferId} signed URL routes missing from runtime registry`);
+		}
+
+		const transfer = {
+			id: transferId,
+			total_chunks: transferRecord.totalChunks,
+			total_bytes: transferRecord.totalBytes,
+			chunk_size: transferRecord.chunkSize,
+			metadata: transferRecord.metadata,
+		};
 
 		const metadata = parseTransferMetadata(transfer.metadata);
 		const testMode = Boolean(metadata?.test_mode);
 		const logicalTotalChunks =
-			metadata?.transfer_version === "signed_url_v1" && typeof metadata.logical_chunk_count === "number"
+			isSignedUrlTransferVersion(metadata?.transfer_version) && typeof metadata?.logical_chunk_count === "number"
 				? metadata.logical_chunk_count
 				: transfer.total_chunks;
 
 		try {
 			if (testMode) {
 				const captured = await this.db.begin(async (sql) => {
-					const selection = await this.selectOrchestrators(sql, testMode, [], transferId);
+					const selection = this.selectOrchestrators(testMode, [], transferId);
 					assertRequiredPoolSelection(selection, testMode, transferId);
 					const sliceSizes = allocateChunkSlices(
 						selection.orchestrators,
@@ -1801,7 +2423,6 @@ export class AssignmentEngine {
 					);
 					const logic = buildAssignmentLogicSummary(testMode, selection, logicalTotalChunks, sliceSizes);
 
-					await this.markTransferInProgress(sql, transferId);
 					const coverage = await this.assignChunkCoverage({
 						sql,
 						transferId,
@@ -1814,19 +2435,64 @@ export class AssignmentEngine {
 					});
 
 					if (!coverage.coveredAllChunks) {
-
+						logger.error(
+							{
+								transferId,
+								totalChunks: logicalTotalChunks,
+								selectedOrchestrators: selection.orchestrators.length,
+								assignedChunkCount: coverage.assignedChunkCount,
+								testMode,
+							},
+							"transfer assignment failed because the control plane could not cover every chunk with live orchestrator acknowledgements",
+						);
 						throw new Error(COVERAGE_FAILURE_MESSAGE);
 					}
 
 					return { selection, sliceSizes, logic, coverage };
 				});
 
+				logger.info(
+					{
+						transferId,
+						testMode,
+						preferredPool: captured.selection.preferredPool,
+						selectionRule: captured.selection.selectionRule,
+						candidateCounts: captured.selection.counts,
+						diagnostics: captured.selection.diagnostics,
+						logic: captured.logic,
+						qualifiedSelectionNarrative: captured.logic.qualifiedSelectionNarrative,
+						distribution: {
+							assignmentCount: captured.coverage.assignmentIds.length,
+							assignedChunkCount: captured.coverage.assignedChunkCount,
+							totalChunks: logicalTotalChunks,
+							sliceSizes: captured.sliceSizes.filter((size) => size > 0),
+						},
+						assignmentSlices: captured.coverage.assignmentSlices,
+					},
+					"transfer assignment summary",
+				);
 
-
-				void this.dispatchAssignmentPushes(transferId, metadata, captured.coverage.pendingPushes).catch((err: unknown) => {
-
+				this.registerTransferStarted({
+					transferId,
+					totalBytes: Number(transfer.total_bytes),
+					totalChunks: logicalTotalChunks,
+					chunkSize: transfer.chunk_size,
+					metadata: transfer.metadata,
+				});
+				this.registerRuntimeAssignments({
+					transferId,
+					totalBytes: Number(transfer.total_bytes),
+					totalChunks: logicalTotalChunks,
+					chunkSize: transfer.chunk_size,
+					metadata: transfer.metadata,
+					pendingPushes: captured.coverage.pendingPushes,
 				});
 
+				void this.dispatchTaskOfferBatches(transferId, captured.coverage.pendingPushes).catch((err: unknown) => {
+					logger.error({ err, transferId }, "transfer assignment dispatch failed");
+				});
+
+				beginDistributePhase(transferId, captured.coverage.assignmentIds.length);
 				return captured.coverage.assignmentIds;
 			}
 
@@ -1841,13 +2507,9 @@ export class AssignmentEngine {
 
 			try {
 				captured = await this.db.begin(async (sql) => {
-					const [ringRow] = await sql<{ qualified_ring_cursor: string }[]>`
-						SELECT qualified_ring_cursor FROM core.qualified_assignment_ring WHERE singleton = TRUE FOR UPDATE
-					`;
-					const lockedCursor = BigInt(ringRow?.qualified_ring_cursor ?? "0");
+					const lockedCursor = this.routingRegistry.getQualifiedRingCursor();
 
-					const selection = await this.selectOrchestrators(
-						sql,
+					const selection = this.selectOrchestrators(
 						false,
 						[],
 						transferId,
@@ -1872,7 +2534,6 @@ export class AssignmentEngine {
 					selection.orchestrators = slicePlan.orchestrators;
 					selection.qualifiedAssignmentPlan = slicePlan.plan;
 
-					await this.markTransferInProgress(sql, transferId);
 					const coverage = await this.assignChunkCoverage({
 						sql,
 						transferId,
@@ -1892,6 +2553,7 @@ export class AssignmentEngine {
 					await this.persistAssignmentPlan(sql, transferId, "qualified", slicePlan.plan);
 
 					const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
+					this.routingRegistry.advanceQualifiedRingCursor(nextStored);
 					await sql`
 						UPDATE core.qualified_assignment_ring
 						SET qualified_ring_cursor = ${Number(nextStored)}
@@ -1908,7 +2570,14 @@ export class AssignmentEngine {
 				});
 			} catch (e) {
 				if ((e as Error)?.message === "__ASSIGN_COVERAGE_FAIL__") {
-
+					logger.error(
+						{
+							transferId,
+							totalChunks: logicalTotalChunks,
+							testMode: false,
+						},
+						"transfer assignment failed because the control plane could not cover every chunk with live orchestrator acknowledgements",
+					);
 					throw new Error(COVERAGE_FAILURE_MESSAGE);
 				}
 				throw e;
@@ -1925,16 +2594,53 @@ export class AssignmentEngine {
 				captured.sliceSizes,
 			);
 
+			logger.info(
+				{
+					transferId,
+					testMode: false,
+					preferredPool: captured.selection.preferredPool,
+					selectionRule: captured.selection.selectionRule,
+					candidateCounts: captured.selection.counts,
+					diagnostics: captured.selection.diagnostics,
+					logic,
+					qualifiedSelectionNarrative: logic.qualifiedSelectionNarrative,
+					qualifiedRing: qualifiedRingLogFields(captured.selection.qualifiedRing),
+					distribution: {
+						assignmentCount: captured.coverage.assignmentIds.length,
+						assignedChunkCount: captured.coverage.assignedChunkCount,
+						totalChunks: logicalTotalChunks,
+						sliceSizes: captured.sliceSizes.filter((size) => size > 0),
+					},
+					assignmentSlices: captured.coverage.assignmentSlices,
+				},
+				"transfer assignment summary",
+			);
 
-
-			void this.dispatchAssignmentPushes(transferId, metadata, captured.coverage.pendingPushes).catch((err: unknown) => {
-
+			this.registerTransferStarted({
+				transferId,
+				totalBytes: Number(transfer.total_bytes),
+				totalChunks: logicalTotalChunks,
+				chunkSize: transfer.chunk_size,
+				metadata: transfer.metadata,
+			});
+			this.registerRuntimeAssignments({
+				transferId,
+				totalBytes: Number(transfer.total_bytes),
+				totalChunks: logicalTotalChunks,
+				chunkSize: transfer.chunk_size,
+				metadata: transfer.metadata,
+				pendingPushes: captured.coverage.pendingPushes,
 			});
 
+			void this.dispatchTaskOfferBatches(transferId, captured.coverage.pendingPushes).catch((err: unknown) => {
+				logger.error({ err, transferId }, "transfer assignment dispatch failed");
+			});
+
+			beginDistributePhase(transferId, captured.coverage.assignmentIds.length);
 			return captured.assignmentIds;
 		} catch (error) {
 			if (isTerminalAssignmentFailure(error)) {
-				await this.failTransferAssignment(transferId, error.message);
+				this.failTransferAssignment(transferId, error.message);
 			}
 			throw error;
 		}
@@ -1956,31 +2662,6 @@ export class AssignmentEngine {
 	}
 
 	async expireTransferAssignment(input: { assignmentId: string; reason: string }): Promise<void> {
-		await this.db`
-			UPDATE core.transfer_assignments
-			SET status = 'expired',
-				completed_at = COALESCE(completed_at, NOW())
-			WHERE id = ${input.assignmentId}
-				AND status NOT IN ('completed', 'failed', 'expired')
-		`;
-	}
-
-	async reassignTask(taskId: string, excludeWorkerId?: string): Promise<void> {
-		const tasks = await this.db<{ orchestrator_id: string }[]>`
-      SELECT orchestrator_id AS orchestrator_id FROM core.tasks WHERE id = ${taskId}
-    `;
-		const task = tasks[0];
-		if (!task) return;
-
-		const orchs = await this.db<{ hotkey: string }[]>`
-	      SELECT hotkey FROM core.orchestrators WHERE id = ${task.orchestrator_id} LIMIT 1
-    `;
-		if (!orchs.length) return;
-
-		pushToOrchestrator(orchs[0]!.hotkey, {
-			type: "task_reassign",
-			task_id: taskId,
-			...(excludeWorkerId ? { exclude_worker_id: excludeWorkerId } : {}),
-		});
+		this.offerRegistry.updateAssignmentStatus(input.assignmentId, "expired", input.reason);
 	}
 }

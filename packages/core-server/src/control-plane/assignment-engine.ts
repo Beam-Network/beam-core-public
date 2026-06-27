@@ -3,7 +3,7 @@
  * persists assignments, creates task-offer batches, and notifies orchestrators through the live gateway.
  *
  * This transparency copy inlines supporting helpers that live in separate modules in the full
- * BeamCore tree (assignment math, transfer metadata, qualified-ring windows, task-offer delivery,
+ * BeamCore tree (assignment math, transfer metadata, qualified base-pool slicing, task-offer delivery,
  * distribute-phase metrics, worker gateway interfaces, and runtime registry interfaces).
  */
 
@@ -23,8 +23,6 @@ const ASSIGNMENT_DEFAULTS = {
 	TRANSFER_RECOVERY_SPEED_WINDOW_SECONDS: 15,
 	TRANSFER_RECOVERY_TASK_PRIORITY: 10,
 	SIGNED_URL_MIN_TTL_SECONDS: 600,
-	QUALIFIED_WINDOW_RATIO: 0.6,
-	MIN_QUALIFIED_WINDOW_SIZE: 10,
 };
 
 const env = ASSIGNMENT_DEFAULTS;
@@ -94,25 +92,10 @@ export type AssignmentSelectionRule =
 	| "qualifying_equal_share_rotation"
 	| "recovery_transfer_speed";
 
-export interface QualifiedRingSelectionMeta {
-	n: number;
-	totalChunks: number;
-	qualifiedWindowRatio: number;
-	minQualifiedWindowSize: number;
-	competitionWindowSize: number;
-	cursorBeforeMod: bigint;
-	cursorAfterMod: bigint;
-	startIndex: number;
-	windowHotkeyCount?: number;
-	virtualCompetitorCount?: number;
-	nOwnerGroupsInPool?: number;
-}
-
 export interface SelectionResult {
 	orchestrators: OrchestratorCandidate[];
 	preferredPool: "qualifying" | "qualified";
 	selectionRule: AssignmentSelectionRule;
-	qualifiedRing?: QualifiedRingSelectionMeta;
 	qualifiedAssignmentPlan?: unknown;
 	counts: {
 		queried: number;
@@ -245,8 +228,6 @@ export interface TerminalTransferSnapshot {
 export interface OrchestratorRoutingRegistry {
 	listReadyCandidates(excludeIds: string[], excludeOwnerGroupIds: string[]): OrchestratorCandidate[];
 	getOwnerGroupId(orchestratorId: string): string | null;
-	getQualifiedRingCursor(): bigint;
-	advanceQualifiedRingCursor(next: bigint): void;
 }
 
 export interface DeliveryResult {
@@ -485,10 +466,10 @@ export function allocateRecoverySpeedSlices(input: {
 	return sliceSizes;
 }
 
-export interface OwnerGroupWindowSlot {
+export interface OwnerGroupAllocationSlot {
 	ownerGroupId: string | null;
-	windowMemberOrchestratorIds: string[];
-	windowMemberHotkeys: string[];
+	baseMemberOrchestratorIds: string[];
+	baseMemberHotkeys: string[];
 	memberActualPrismScores: number[];
 	averagePrismScore: number;
 	interGroupSliceSize: number;
@@ -496,19 +477,18 @@ export interface OwnerGroupWindowSlot {
 }
 
 export interface QualifiedAssignmentPlan {
-	version: 1;
+	version: 2;
 	transferId: string;
 	pool: "qualified";
 	selectionRule: "prism_final_score_desc";
-	ring: QualifiedRingSelectionMeta;
 	counts: {
 		preferredHotkeys: number;
 		ownerGroupsInPool: number;
-		windowHotkeyCount: number;
+		baseHotkeyCount: number;
 		virtualCompetitorCount: number;
 	};
-	windowHotkeysOrdered: string[];
-	virtualCompetitors: OwnerGroupWindowSlot[];
+	baseHotkeysOrdered: string[];
+	ownerGroupAllocationSlots: OwnerGroupAllocationSlot[];
 	deliveries: Array<{
 		orchestratorId: string;
 		hotkey: string;
@@ -520,18 +500,18 @@ export interface QualifiedAssignmentPlan {
 	}>;
 }
 
-export interface QualifiedWindowSlicePlan {
+export interface QualifiedPoolSlicePlan {
 	orchestrators: OrchestratorCandidate[];
 	sliceSizes: number[];
 	plan: QualifiedAssignmentPlan;
 }
 
-interface WindowGroup {
+interface BasePoolGroup {
 	ownerGroupId: string | null;
 	members: OrchestratorCandidate[];
 }
 
-function compareWindowUidAscNullsLast(a: number | null, b: number | null): number {
+function compareBasePoolUidAscNullsLast(a: number | null, b: number | null): number {
 	if (a === null && b === null) return 0;
 	if (a === null) return 1;
 	if (b === null) return -1;
@@ -541,15 +521,15 @@ function compareWindowUidAscNullsLast(a: number | null, b: number | null): numbe
 function sortMembers(members: OrchestratorCandidate[]): OrchestratorCandidate[] {
 	return [...members].sort(
 		(a, b) =>
-			compareWindowUidAscNullsLast(a.uid, b.uid) ||
+			compareBasePoolUidAscNullsLast(a.uid, b.uid) ||
 			a.hotkey.localeCompare(b.hotkey) ||
 			a.id.localeCompare(b.id),
 	);
 }
 
-function partitionWindowGroups(windowOrchs: OrchestratorCandidate[]): WindowGroup[] {
+function partitionBasePoolGroups(baseOrchs: OrchestratorCandidate[]): BasePoolGroup[] {
 	const byKey = new Map<string, OrchestratorCandidate[]>();
-	for (const orch of windowOrchs) {
+	for (const orch of baseOrchs) {
 		const key = orch.owner_group_id ?? `singleton:${orch.id}`;
 		const list = byKey.get(key) ?? [];
 		list.push(orch);
@@ -567,7 +547,7 @@ function averagePrismScore(members: OrchestratorCandidate[]): number {
 	return scores.reduce((sum, s) => sum + s, 0) / scores.length;
 }
 
-function virtualCandidateForGroup(group: WindowGroup): OrchestratorCandidate {
+function virtualCandidateForGroup(group: BasePoolGroup): OrchestratorCandidate {
 	const rep = group.members[0]!;
 	const avg = averagePrismScore(group.members);
 	return {
@@ -584,25 +564,24 @@ export function countDistinctOwnerGroupsInPool(candidates: OrchestratorCandidate
 	return keys.size;
 }
 
-export function buildQualifiedWindowSlicePlan(input: {
+export function buildQualifiedPoolSlicePlan(input: {
 	transferId: string;
-	windowOrchs: OrchestratorCandidate[];
+	baseOrchs: OrchestratorCandidate[];
 	totalChunks: number;
-	ring: QualifiedRingSelectionMeta;
 	preferredHotkeys: number;
 	ownerGroupsInPool: number;
-}): QualifiedWindowSlicePlan {
-	const windowGroups = partitionWindowGroups(input.windowOrchs);
-	const virtualCompetitors = windowGroups.map((g) => virtualCandidateForGroup(g));
+}): QualifiedPoolSlicePlan {
+	const basePoolGroups = partitionBasePoolGroups(input.baseOrchs);
+	const virtualCompetitors = basePoolGroups.map((g) => virtualCandidateForGroup(g));
 	const interGroupSlices = allocateChunkSlices(virtualCompetitors, input.totalChunks, "prism_final_score_desc");
 
 	const deliveries: QualifiedAssignmentPlan["deliveries"] = [];
 	const flatOrchs: OrchestratorCandidate[] = [];
 	const flatSlices: number[] = [];
-	const virtualSlots: OwnerGroupWindowSlot[] = [];
+	const ownerGroupAllocationSlots: OwnerGroupAllocationSlot[] = [];
 
-	for (let gi = 0; gi < windowGroups.length; gi++) {
-		const group = windowGroups[gi]!;
+	for (let gi = 0; gi < basePoolGroups.length; gi++) {
+		const group = basePoolGroups[gi]!;
 		const interTotal = interGroupSlices[gi] ?? 0;
 		const memberScores = group.members.map((m) => Math.max(0, numericValue(m.prism_final_score)));
 		const memberSlices =
@@ -611,10 +590,10 @@ export function buildQualifiedWindowSlicePlan(input: {
 				: memberScores.map(() => 0);
 		const avg = averagePrismScore(group.members);
 
-		virtualSlots.push({
+		ownerGroupAllocationSlots.push({
 			ownerGroupId: group.ownerGroupId,
-			windowMemberOrchestratorIds: group.members.map((m) => m.id),
-			windowMemberHotkeys: group.members.map((m) => m.hotkey),
+			baseMemberOrchestratorIds: group.members.map((m) => m.id),
+			baseMemberHotkeys: group.members.map((m) => m.hotkey),
 			memberActualPrismScores: memberScores,
 			averagePrismScore: avg,
 			interGroupSliceSize: interTotal,
@@ -639,30 +618,22 @@ export function buildQualifiedWindowSlicePlan(input: {
 		}
 	}
 
-	const ring: QualifiedRingSelectionMeta = {
-		...input.ring,
-		windowHotkeyCount: input.windowOrchs.length,
-		virtualCompetitorCount: windowGroups.length,
-		nOwnerGroupsInPool: input.ownerGroupsInPool,
-	};
-
 	return {
 		orchestrators: flatOrchs,
 		sliceSizes: flatSlices,
 		plan: {
-			version: 1,
+			version: 2,
 			transferId: input.transferId,
 			pool: "qualified",
 			selectionRule: "prism_final_score_desc",
-			ring,
 			counts: {
 				preferredHotkeys: input.preferredHotkeys,
 				ownerGroupsInPool: input.ownerGroupsInPool,
-				windowHotkeyCount: input.windowOrchs.length,
-				virtualCompetitorCount: windowGroups.length,
+				baseHotkeyCount: input.baseOrchs.length,
+				virtualCompetitorCount: basePoolGroups.length,
 			},
-			windowHotkeysOrdered: input.windowOrchs.map((o) => o.hotkey),
-			virtualCompetitors: virtualSlots,
+			baseHotkeysOrdered: input.baseOrchs.map((o) => o.hotkey),
+			ownerGroupAllocationSlots,
 			deliveries,
 		},
 	};
@@ -1452,95 +1423,41 @@ function compareUidAscNullsLast(a: number | null, b: number | null): number {
 	return a - b;
 }
 
-/** Exported for tests — qualified competition window size (plan formula). */
-export function computeQualifiedCompetitionWindowSize(
-	totalChunks: number,
-	n: number,
-	qualifiedWindowRatio: number,
-	minQualifiedWindowSize: number,
-): number {
-	if (n <= 0 || totalChunks <= 0) return 0;
-	const scaled = Math.ceil(totalChunks * qualifiedWindowRatio);
-	return Math.min(n, Math.max(minQualifiedWindowSize, scaled));
-}
-
-/** Pick `competitionWindowSize` candidates from uid-sorted list after rotating ring by `startIndex`. */
-export function pickQualifiedCompetitionWindow<T>(
-	uidSorted: T[],
-	startIndex: number,
-	competitionWindowSize: number,
-): T[] {
-	if (!uidSorted.length || competitionWindowSize <= 0) return [];
-	return rotateCandidates(uidSorted, startIndex).slice(0, competitionWindowSize);
-}
-
-export function advanceQualifiedRingCursor(cursor: bigint, windowSize: number, n: number): bigint {
-	if (n <= 0) return cursor;
-	const w = BigInt(windowSize);
-	const nn = BigInt(n);
-	return (cursor + w) % nn;
-}
-
-/** Pino/JSON cannot serialize bigint fields on assignment ring metadata. */
-function qualifiedRingLogFields(ring: QualifiedRingSelectionMeta | undefined) {
-	if (!ring) return undefined;
-	return qualifiedRingForJson(ring);
-}
-
-function qualifiedRingForJson(ring: QualifiedRingSelectionMeta) {
-	return {
-		n: ring.n,
-		totalChunks: ring.totalChunks,
-		qualifiedWindowRatio: ring.qualifiedWindowRatio,
-		minQualifiedWindowSize: ring.minQualifiedWindowSize,
-		competitionWindowSize: ring.competitionWindowSize,
-		cursorBeforeMod: ring.cursorBeforeMod.toString(),
-		cursorAfterMod: ring.cursorAfterMod.toString(),
-		startIndex: ring.startIndex,
-		windowHotkeyCount: ring.windowHotkeyCount,
-		virtualCompetitorCount: ring.virtualCompetitorCount,
-		nOwnerGroupsInPool: ring.nOwnerGroupsInPool,
-	};
-}
-
 function buildAssignmentLogicSummary(
-	testMode: boolean,
-	selection: SelectionResult,
-	totalChunks: number,
-	sliceSizes: number[],
+    testMode: boolean,
+    selection: SelectionResult,
+    totalChunks: number,
+    sliceSizes: number[],
 ): AssignmentLogicSummary {
-	const transferClass = testMode ? "test" : "production";
-	const poolDecision = `BeamCore restricts ${transferClass} transfers to the ${selection.preferredPool} tier and found ${selection.counts.preferred} eligible orchestrators there`;
-	const candidateScreening = `queried ${selection.counts.queried} ready orchestrators; ${selection.counts.websocketReady} had a live WebSocket; worker-session count is not an orchestrator selection gate`;
-	const nonZeroSlices = sliceSizes.filter((size) => size > 0);
-	const ring = selection.qualifiedRing;
-	const rankingDecision =
-		selection.selectionRule === "prism_final_score_desc"
-			? ring
-				? `qualified pool: uid ordering with chunk-scaled competition window (n=${ring.n}, totalChunks=${ring.totalChunks}, ratio=${ring.qualifiedWindowRatio}, minWindow=${ring.minQualifiedWindowSize}, window=${ring.competitionWindowSize}); ring startIndex=${ring.startIndex}, cursorMod before=${ring.cursorBeforeMod} after=${ring.cursorAfterMod}; PRISM ordering within window — top: ${topRankedSummary(selection.orchestrators)}`
-				: `eligible orchestrators were ranked by highest PRISM final score; top ranking: ${topRankedSummary(selection.orchestrators)}`
-			: `eligible qualifying-pool orchestrators were ordered by deterministic rotation; front of rotation: ${orderedSummary(selection.orchestrators)}`;
-	const distributionDecision =
-		selection.selectionRule === "prism_final_score_desc"
-			? `split ${totalChunks} chunks proportionally by PRISM final score across ${nonZeroSlices.length} orchestrators; slice sizes: ${nonZeroSlices.join(",")}`
-			: `split ${totalChunks} chunks as evenly as possible across ${nonZeroSlices.length} orchestrators with rotated remainder priority; slice sizes: ${nonZeroSlices.join(",")}`;
-	const qualifiedSelectionNarrative = ring
-		? `Qualified selection used a uid-ordered ring with a chunk-scaled competition window (n=${ring.n} hotkeys, ${ring.nOwnerGroupsInPool ?? "?"} owner groups in pool). Window size ${ring.competitionWindowSize} (${ring.windowHotkeyCount ?? "?"} hotkeys, ${ring.virtualCompetitorCount ?? "?"} virtual competitors after grouping). Stage A: inter-group Hamilton on average PRISM per owner group in the window. Stage B: intra-group Hamilton on each member's actual PRISM. Ring cursor startIndex=${ring.startIndex}; mod before ${ring.cursorBeforeMod}, after ${ring.cursorAfterMod}.`
-		: undefined;
+    const transferClass = testMode ? "test" : "production";
+    const poolDecision = `BeamCore restricts ${transferClass} transfers to the ${selection.preferredPool} tier and found ${selection.counts.preferred} eligible orchestrators there`;
+    const candidateScreening = `queried ${selection.counts.queried} ready orchestrators; ${selection.counts.websocketReady} had a live WebSocket; worker-session count is not an orchestrator selection gate`;
+    const nonZeroSlices = sliceSizes.filter((size) => size > 0);
+    const rankingDecision =
+        selection.selectionRule === "prism_final_score_desc"
+            ? `qualified pool: full assignable base pool ordered by UID, then owner-group fairness and PRISM/Hamilton distribution; top assigned: ${topRankedSummary(selection.orchestrators)}`
+            : `eligible qualifying-pool orchestrators were ordered by deterministic rotation; front of rotation: ${orderedSummary(selection.orchestrators)}`;
+    const distributionDecision =
+        selection.selectionRule === "prism_final_score_desc"
+            ? `split ${totalChunks} chunks proportionally by PRISM final score across ${nonZeroSlices.length} orchestrators; slice sizes: ${nonZeroSlices.join(",")}`
+            : `split ${totalChunks} chunks as evenly as possible across ${nonZeroSlices.length} orchestrators with rotated remainder priority; slice sizes: ${nonZeroSlices.join(",")}`;
+    const qualifiedSelectionNarrative =
+        selection.selectionRule === "prism_final_score_desc"
+            ? `Qualified selection used the full assignable qualified base pool (${selection.counts.preferred} hotkeys). Stage A: inter-group Hamilton on average PRISM per owner group in the base pool. Stage B: intra-group Hamilton on each member's actual PRISM.`
+            : undefined;
 
-	const summary: AssignmentLogicSummary = {
-		transferClass,
-		poolDecision,
-		rankingDecision,
-		candidateScreening,
-		distributionDecision,
-	};
-	if (qualifiedSelectionNarrative !== undefined) {
-		summary.qualifiedSelectionNarrative = qualifiedSelectionNarrative;
-	}
-	return summary;
+    const summary: AssignmentLogicSummary = {
+        transferClass,
+        poolDecision,
+        rankingDecision,
+        candidateScreening,
+        distributionDecision,
+    };
+    if (qualifiedSelectionNarrative !== undefined) {
+        summary.qualifiedSelectionNarrative = qualifiedSelectionNarrative;
+    }
+    return summary;
 }
-
 function assertRequiredPoolSelection(
 	selection: SelectionResult,
 	testMode: boolean,
@@ -1661,8 +1578,6 @@ export class AssignmentEngine {
 		testMode: boolean,
 		excludeIds: string[] = [],
 		orderSeed?: string,
-		logicalTotalChunks?: number,
-		qualifiedRingCursorLocked?: bigint,
 		options: {
 			recoverySelection?: boolean;
 			transferId?: string;
@@ -1695,7 +1610,6 @@ export class AssignmentEngine {
 		);
 
 		let sorted: OrchestratorCandidate[];
-		let qualifiedRing: QualifiedRingSelectionMeta | undefined;
 		let selectionRule: AssignmentSelectionRule;
 
 		if (options.recoverySelection && options.transferId) {
@@ -1738,60 +1652,30 @@ export class AssignmentEngine {
 					? ("qualifying_equal_share_rotation" as const)
 					: ("prism_final_score_desc" as const);
 
-		if (selectionRule === "qualifying_equal_share_rotation") {
-			sorted = rotateCandidates(
-				[...preferred].sort((a, b) => a.hotkey.localeCompare(b.hotkey) || a.id.localeCompare(b.id)),
-				preferred.length > 0 ? hashSeed(orderSeed ?? "") % preferred.length : 0,
-			);
-		} else if (preferredPool === "qualifying") {
-			sorted = [...preferred].sort(
-				(a, b) =>
-					numericValue(b.prism_final_score) - numericValue(a.prism_final_score) ||
-					compareUidAscNullsLast(a.uid, b.uid) ||
-					a.hotkey.localeCompare(b.hotkey) ||
-					a.id.localeCompare(b.id),
-			);
-		} else {
-			const n = preferred.length;
-			if (n === 0) {
-				sorted = [];
-			} else {
-				if (logicalTotalChunks === undefined || qualifiedRingCursorLocked === undefined) {
-					throw new Error(
-						"qualified pool selection requires logicalTotalChunks and locked qualified ring cursor",
-					);
-				}
-				const uidSorted = [...preferred].sort(
-					(a, b) =>
-						compareUidAscNullsLast(a.uid, b.uid) ||
-						a.hotkey.localeCompare(b.hotkey) ||
-						a.id.localeCompare(b.id),
-				);
-				const ratio = env.QUALIFIED_WINDOW_RATIO;
-				const minW = env.MIN_QUALIFIED_WINDOW_SIZE;
-				const competitionWindowSize = computeQualifiedCompetitionWindowSize(logicalTotalChunks, n, ratio, minW);
-				const nn = BigInt(n);
-				const cursorBeforeMod = qualifiedRingCursorLocked % nn;
-				const startIndex = Number(cursorBeforeMod);
-				sorted = pickQualifiedCompetitionWindow(uidSorted, startIndex, competitionWindowSize);
-				const cursorAfter = advanceQualifiedRingCursor(qualifiedRingCursorLocked, competitionWindowSize, n);
-				const cursorAfterMod = cursorAfter % nn;
-				qualifiedRing = {
-					n,
-					totalChunks: logicalTotalChunks,
-					qualifiedWindowRatio: ratio,
-					minQualifiedWindowSize: minW,
-					competitionWindowSize,
-					cursorBeforeMod,
-					cursorAfterMod,
-					startIndex,
-					nOwnerGroupsInPool: countDistinctOwnerGroupsInPool(preferred),
-				};
-			}
-		}
-		}
+        if (selectionRule === "qualifying_equal_share_rotation") {
+            sorted = rotateCandidates(
+                [...preferred].sort((a, b) => a.hotkey.localeCompare(b.hotkey) || a.id.localeCompare(b.id)),
+                preferred.length > 0 ? hashSeed(orderSeed ?? "") % preferred.length : 0,
+            );
+        } else if (preferredPool === "qualifying") {
+            sorted = [...preferred].sort(
+                (a, b) =>
+                    numericValue(b.prism_final_score) - numericValue(a.prism_final_score) ||
+                    compareUidAscNullsLast(a.uid, b.uid) ||
+                    a.hotkey.localeCompare(b.hotkey) ||
+                    a.id.localeCompare(b.id),
+            );
+        } else {
+            sorted = [...preferred].sort(
+                (a, b) =>
+                    compareUidAscNullsLast(a.uid, b.uid) ||
+                    a.hotkey.localeCompare(b.hotkey) ||
+                    a.id.localeCompare(b.id),
+            );
+        }
+        }
 
-		const counts = {
+        const counts = {
 			queried: allCandidates.length,
 			websocketReady: websocketReady.length,
 			eligible: eligible.length,
@@ -1831,9 +1715,6 @@ export class AssignmentEngine {
 				connectedRegistryHotkeys: connectedRegistry,
 			},
 		};
-		if (qualifiedRing !== undefined) {
-			result.qualifiedRing = qualifiedRing;
-		}
 		return result;
 	}
 
@@ -1843,13 +1724,9 @@ export class AssignmentEngine {
 		pool: "qualified" | "qualifying",
 		plan: QualifiedAssignmentPlan,
 	): Promise<void> {
-		const storablePlan =
-			pool === "qualified"
-				? { ...plan, ring: qualifiedRingForJson(plan.ring) }
-				: plan;
 		await sql`
 			INSERT INTO core.transfer_assignment_plans (transfer_id, pool, plan)
-			VALUES (${transferId}, ${pool}, ${sql.json(storablePlan as never)})
+			VALUES (${transferId}, ${pool}, ${sql.json(plan as never)})
 		`;
 	}
 
@@ -2507,29 +2384,15 @@ export class AssignmentEngine {
 
 			try {
 				captured = await this.db.begin(async (sql) => {
-					const lockedCursor = this.routingRegistry.getQualifiedRingCursor();
-
-					const selection = this.selectOrchestrators(
-						false,
-						[],
-						transferId,
-						logicalTotalChunks,
-						lockedCursor,
-					);
+					const selection = this.selectOrchestrators(false, [], transferId);
 					assertRequiredPoolSelection(selection, false, transferId);
 
-					const q = selection.qualifiedRing;
-					if (!q) {
-						throw new Error("qualified assignment missing qualifiedRing metadata");
-					}
-
-					const slicePlan = buildQualifiedWindowSlicePlan({
+					const slicePlan = buildQualifiedPoolSlicePlan({
 						transferId,
-						windowOrchs: selection.orchestrators,
+						baseOrchs: selection.orchestrators,
 						totalChunks: logicalTotalChunks,
-						ring: q,
 						preferredHotkeys: selection.counts.preferred,
-						ownerGroupsInPool: q.nOwnerGroupsInPool ?? selection.counts.preferred,
+						ownerGroupsInPool: countDistinctOwnerGroupsInPool(selection.orchestrators),
 					});
 					selection.orchestrators = slicePlan.orchestrators;
 					selection.qualifiedAssignmentPlan = slicePlan.plan;
@@ -2552,13 +2415,6 @@ export class AssignmentEngine {
 
 					await this.persistAssignmentPlan(sql, transferId, "qualified", slicePlan.plan);
 
-					const nextStored = advanceQualifiedRingCursor(lockedCursor, q.competitionWindowSize, q.n);
-					this.routingRegistry.advanceQualifiedRingCursor(nextStored);
-					await sql`
-						UPDATE core.qualified_assignment_ring
-						SET qualified_ring_cursor = ${Number(nextStored)}
-						WHERE singleton = TRUE
-					`;
 
 					const capturedAssign: CapturedAssign = {
 						assignmentIds: coverage.assignmentIds,
@@ -2604,7 +2460,6 @@ export class AssignmentEngine {
 					diagnostics: captured.selection.diagnostics,
 					logic,
 					qualifiedSelectionNarrative: logic.qualifiedSelectionNarrative,
-					qualifiedRing: qualifiedRingLogFields(captured.selection.qualifiedRing),
 					distribution: {
 						assignmentCount: captured.coverage.assignmentIds.length,
 						assignedChunkCount: captured.coverage.assignedChunkCount,

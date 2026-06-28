@@ -6,7 +6,7 @@
  * materialized UID/weight vector validators read from BeamCore.
  */
 
-import { computeRawScore, normalizeWeightsFromRawScores } from "./epoch-summary-math.js";
+import { computeRawScore, normalizeWeightsWithEmissionTiers, PRISM_WEIGHT_FORMULA_VERSION } from "./epoch-summary-math.js";
 
 export type SqlClient = (<T = unknown>(
 	strings: TemplateStringsArray,
@@ -111,7 +111,7 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 				VALUES
 					(${env.METAGRAPH_NETUID}, ${e}, 0, 0, 0,
 					 TRUE, ${Number(chain.current_block)}, ${chain.blocks_per_epoch},
-					 'prism_final_score_x_tasks_v1', 'epoch_summary_backfill', NOW(), NOW())
+					 ${PRISM_WEIGHT_FORMULA_VERSION}, 'epoch_summary_backfill', NOW(), NOW())
 				ON CONFLICT (netuid, epoch) DO NOTHING
 			`;
 		}
@@ -160,8 +160,14 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 		return { row: r, prism, taskDone, raw };
 	});
 
-	const rawValues = rawScores.map((x) => x.raw);
-	const { weights: normalizedList, sumRaw } = normalizeWeightsFromRawScores(rawValues);
+	const tierInputs = rawScores.map(({ row, prism, taskDone, raw }) => ({
+		uid: row.uid,
+		hotkey: row.hotkey,
+		prismFinalScore: prism,
+		taskDoneCount: taskDone,
+		rawScore: raw,
+	}));
+	const { weights: normalizedList, sumRaw } = normalizeWeightsWithEmissionTiers(tierInputs);
 
 	const orchestrators = rawScores.map(({ row, prism, taskDone, raw }, idx) => ({
 		id: row.id,
@@ -211,7 +217,7 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 					x.performance_score::NUMERIC(6,5),
 					x.penalty_multiplier::NUMERIC(6,5),
 					x.prism_pool,
-					'prism_final_score_x_tasks_v1',
+					${PRISM_WEIGHT_FORMULA_VERSION},
 					'epoch_summary',
 					NOW(),
 					NOW()
@@ -237,6 +243,8 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 					performance_score   = EXCLUDED.performance_score,
 					penalty_multiplier  = EXCLUDED.penalty_multiplier,
 					prism_pool          = EXCLUDED.prism_pool,
+					formula_version     = EXCLUDED.formula_version,
+					source              = EXCLUDED.source,
 					updated_at          = NOW()
 			`;
 		}
@@ -251,7 +259,7 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 				(${env.METAGRAPH_NETUID}, ${epoch},
 				 ${sumRaw}, ${sumTaskDone}, ${orchestrators.length},
 				 ${allWeightsZero}, ${Number(chain.current_block)}, ${chain.blocks_per_epoch},
-				 'prism_final_score_x_tasks_v1', 'epoch_summary', NOW(), NOW())
+				 ${PRISM_WEIGHT_FORMULA_VERSION}, 'epoch_summary', NOW(), NOW())
 			ON CONFLICT (netuid, epoch) DO UPDATE SET
 				sum_raw_weight               = EXCLUDED.sum_raw_weight,
 				sum_task_done_count          = EXCLUDED.sum_task_done_count,
@@ -259,6 +267,8 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 				all_weights_zero             = EXCLUDED.all_weights_zero,
 				current_block                = EXCLUDED.current_block,
 				blocks_per_epoch             = EXCLUDED.blocks_per_epoch,
+				formula_version              = EXCLUDED.formula_version,
+				source                       = EXCLUDED.source,
 				updated_at                   = NOW()
 		`;
 

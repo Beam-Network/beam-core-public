@@ -2,7 +2,7 @@
  * Final validator weight materialization job.
  *
  * Public transparency copy of BeamCore's epoch-summary scheduler job. It converts
- * qualified PRISM scores plus completed production task counts into the
+ * qualified PRISM scores plus completed production task counts from the PRISM evidence window into the
  * materialized UID/weight vector validators read from BeamCore.
  */
 
@@ -66,12 +66,6 @@ interface OrchRow {
 	task_done_count: string;
 }
 
-function estimateEpochStartedAt(chain: { current_block: string; blocks_per_epoch: number; last_synced_at: Date }): Date {
-	const currentBlock = Number(chain.current_block);
-	const blocksPerEpoch = Math.max(1, Number(chain.blocks_per_epoch || 1));
-	const blockOffset = Number.isFinite(currentBlock) ? currentBlock % blocksPerEpoch : 0;
-	return new Date(chain.last_synced_at.getTime() - blockOffset * 12_000);
-}
 
 export const epochSummary: EpochSummaryJob = async ({ db }) => {
 	const chainRows = await db<
@@ -90,7 +84,6 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 	const chain = chainRows[0];
 	if (!chain || chain.current_epoch == null) return;
 	const epoch = chain.current_epoch;
-	const epochStartedAt = estimateEpochStartedAt(chain);
 
 	// Backfill any epochs skipped during downtime/restarts with empty-weight rows.
 	const lastEpochRows = await db<{ last_epoch: number | null }[]>`
@@ -133,21 +126,10 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 			COALESCE(pmq.reliability_score,  0)::text AS reliability_score,
 			COALESCE(pmq.performance_score,  0)::text AS performance_score,
 			COALESCE(pmq.penalty_multiplier, 1)::text AS penalty_multiplier,
-			COALESCE(epoch_tasks.task_done_count, 0)::text AS task_done_count
+			COALESCE(pmq.verified_task_count, 0)::text AS task_done_count
 		FROM core.orchestrators o
 		INNER JOIN core.prism_metrics_qualified pmq ON pmq.orchestrator_id = o.id
 		LEFT JOIN core.neuron_state ns ON ns.netuid = ${env.METAGRAPH_NETUID} AND ns.hotkey = o.hotkey
-		LEFT JOIN (
-			SELECT
-				t.orchestrator_id,
-				COUNT(DISTINCT t.id) AS task_done_count
-			FROM core.tasks t
-			WHERE t.state = 'completed'
-			  AND t.completed_at IS NOT NULL
-			  AND t.completed_at >= ${epochStartedAt}
-			  AND t.test_mode = FALSE
-			GROUP BY t.orchestrator_id
-		) epoch_tasks ON epoch_tasks.orchestrator_id = o.id
 		WHERE o.uid IS NOT NULL
 		  AND o.prism_pool = 'qualified'
 		ORDER BY o.uid ASC, o.hotkey ASC

@@ -1,9 +1,10 @@
 /**
  * Pure helpers for epoch summary weights (testable, no DB).
- * raw_i = prism_final_score_i x task_done_count_i; tiered weights sum to 1 when raw work exists.
+ * raw_i = prism_final_score_i x task_done_count_i, where task_done_count_i is
+ * the completed production task count in the PRISM evidence window.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_prism_final_score_x_tasks_v1";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_prism_final_score_x_prism_evidence_tasks_v1";
 
 export type EmissionTier = "A" | "B" | "C";
 

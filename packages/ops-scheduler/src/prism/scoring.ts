@@ -12,13 +12,11 @@ export interface PrismTaskHourBucket {
 
 export interface PrismPenaltyHourBucket {
 	bucketStart: Date;
-	pop_penalty_count: number;
 	fraud_penalty_count: number;
 	sybil_penalty_count: number;
 }
 
 export interface PenaltyCoefficients {
-	pop: number;
 	fraud: number;
 	sybil: number;
 }
@@ -222,10 +220,9 @@ function decayedPenaltyPressure(
 	let eventCount = 0;
 	for (const bucket of buckets) {
 		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now);
-		pressure += coefficients.pop * bucket.pop_penalty_count * weight;
 		pressure += coefficients.fraud * bucket.fraud_penalty_count * weight;
 		pressure += coefficients.sybil * bucket.sybil_penalty_count * weight;
-		eventCount += bucket.pop_penalty_count + bucket.fraud_penalty_count + bucket.sybil_penalty_count;
+		eventCount += bucket.fraud_penalty_count + bucket.sybil_penalty_count;
 	}
 	return {
 		pressure,

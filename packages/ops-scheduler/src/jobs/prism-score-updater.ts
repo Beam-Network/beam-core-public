@@ -1,8 +1,8 @@
 /**
- * PRISM score refresh job: aggregates recent proofs, tasks, and penalties, runs `computePrismScore`,
+ * PRISM score refresh job: aggregates recent tasks, bandwidth, and penalties, runs `computePrismScore`,
  * and persists results to qualifying/qualified metric tables and orchestrator routing fields.
  *
- * This transparency copy inlines pipeline, evidence loaders, and POP penalty materialization from beam-core.
+ * This transparency copy inlines pipeline and evidence loaders from beam-core.
  */
 
 import {
@@ -74,7 +74,6 @@ const PRISM_DEFAULTS = {
 	PRISM_EVIDENCE_LOOKBACK_DAYS: 7,
 	PRISM_TARGET_GRADUATION_VERIFIED_TASKS: 120,
 	PRISM_AGE_SATURATION_DAYS: 7,
-	PRISM_PENALTY_COEFF_POP: 0.05,
 	PRISM_PENALTY_COEFF_FRAUD: 0.05,
 	PRISM_PENALTY_COEFF_SYBIL: 0.05,
 	PRISM_GRADUATION_CONFIDENCE: 0.9,
@@ -99,7 +98,6 @@ export interface PrismHourAgg {
 	failed_task_count: number;
 	overseer_intervention_count: number;
 	// penalties
-	pop_penalty_count: number;
 	fraud_penalty_count: number;
 	sybil_penalty_count: number;
 }
@@ -128,7 +126,6 @@ export async function loadPrismHourlyAggregates(
 			last_proof_at,
 			failed_task_count::int,
 			overseer_intervention_count::int,
-			pop_penalty_count::int,
 			fraud_penalty_count::int,
 			sybil_penalty_count::int
 		FROM core.prism_evidence_hourly
@@ -168,7 +165,6 @@ export function toPrismTaskHourBuckets(agg: PrismHourAgg): PrismTaskHourBucket {
 export function toPrismPenaltyHourBuckets(agg: PrismHourAgg): PrismPenaltyHourBucket {
 	return {
 		bucketStart: agg.bucket_start,
-		pop_penalty_count: agg.pop_penalty_count,
 		fraud_penalty_count: agg.fraud_penalty_count,
 		sybil_penalty_count: agg.sybil_penalty_count,
 	};
@@ -547,7 +543,6 @@ export interface PrismConfigRow {
 	half_life_hours: number;
 	performance_throughput_weight: number;
 	performance_reliability_weight: number;
-	penalty_coeff_pop: number;
 	penalty_coeff_fraud: number;
 	penalty_coeff_sybil: number;
 	verified_task_target: number;
@@ -565,7 +560,6 @@ export async function loadPrismConfig(db: Db): Promise<PrismConfigRow | null> {
 			half_life_hours::int AS half_life_hours,
 			performance_throughput_weight::float8 AS performance_throughput_weight,
 			performance_reliability_weight::float8 AS performance_reliability_weight,
-			penalty_coeff_pop::float8 AS penalty_coeff_pop,
 			penalty_coeff_fraud::float8 AS penalty_coeff_fraud,
 			penalty_coeff_sybil::float8 AS penalty_coeff_sybil,
 			verified_task_target::int AS verified_task_target,
@@ -647,7 +641,6 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	const rawConfig = await loadPrismConfig(db);
 	const config = rawConfig ?? {
 		evidence_lookback_days: PRISM_DEFAULTS.PRISM_EVIDENCE_LOOKBACK_DAYS,
-		penalty_coeff_pop: PRISM_DEFAULTS.PRISM_PENALTY_COEFF_POP,
 		penalty_coeff_fraud: PRISM_DEFAULTS.PRISM_PENALTY_COEFF_FRAUD,
 		penalty_coeff_sybil: PRISM_DEFAULTS.PRISM_PENALTY_COEFF_SYBIL,
 		performance_throughput_weight: PRISM_DEFAULTS.PRISM_PERFORMANCE_THROUGHPUT_WEIGHT,
@@ -659,7 +652,6 @@ export const prismScoreUpdater: PrismScoreUpdaterJob = async ({ db }) => {
 	const lookbackDays = config.evidence_lookback_days;
 
 	const penaltyCoefficients: PenaltyCoefficients = {
-		pop: config.penalty_coeff_pop,
 		fraud: config.penalty_coeff_fraud,
 		sybil: config.penalty_coeff_sybil,
 	};

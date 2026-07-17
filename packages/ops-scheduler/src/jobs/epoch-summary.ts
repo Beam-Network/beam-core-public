@@ -1,48 +1,12 @@
-/**
- * Final validator weight materialization job.
- *
- * Public transparency copy of BeamCore's epoch-summary scheduler job. It converts
- * qualified PRISM scores plus completed production task counts from the PRISM evidence window into the
- * materialized UID/weight vector validators read from BeamCore.
- */
-
+import type { JobFn } from "../runner.js";
+import { logger } from "../logger.js";
+import { env } from "../config.js";
 import { computeRawScore, normalizeWeightsWithEmissionTiers, PRISM_WEIGHT_FORMULA_VERSION } from "./epoch-summary-math.js";
 
-export type SqlClient = (<T = unknown>(
-	strings: TemplateStringsArray,
-	...values: unknown[]
-) => Promise<T>) & {
-	json: (value: unknown) => unknown;
-};
-
-export type DbClient = SqlClient & {
-	begin<T>(fn: (sql: SqlClient) => Promise<T>): Promise<T>;
-};
-
-export interface EpochSummaryContext {
-	db: DbClient;
-}
-
-export type EpochSummaryJob = (ctx: EpochSummaryContext) => Promise<void>;
-
-const logger = {
-	info(_data: unknown, _message?: string): void {},
-};
-
-const PUBLIC_DEFAULT_METAGRAPH_NETUID = 105;
 const MAX_UINT16 = 65_535;
 const BLOCKS_PER_SECOND = 1 / 12;
 const SECONDS_PER_DAY = 86_400;
 const BLOCKS_PER_DAY = BLOCKS_PER_SECOND * SECONDS_PER_DAY; // 7200
-
-function envNumber(name: string, fallback: number): number {
-	const parsed = Number(process.env[name]);
-	return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-const env = {
-	METAGRAPH_NETUID: envNumber("METAGRAPH_NETUID", PUBLIC_DEFAULT_METAGRAPH_NETUID),
-};
 
 function toUint16Weight(normalizedWeight: number): number {
 	return Math.max(0, Math.min(MAX_UINT16, Math.floor(normalizedWeight * MAX_UINT16)));
@@ -62,12 +26,13 @@ interface OrchRow {
 	throughput_score: string;
 	reliability_score: string;
 	performance_score: string;
+	readiness_active_time_multiplier: string;
 	penalty_multiplier: string;
 	task_done_count: string;
 }
 
 
-export const epochSummary: EpochSummaryJob = async ({ db }) => {
+export const epochSummary: JobFn = async ({ db }) => {
 	const chainRows = await db<
 		{ current_epoch: number | null; current_block: string; blocks_per_epoch: number; last_synced_at: Date }[]
 	>`
@@ -120,11 +85,11 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 			o.hotkey,
 			o.uid,
 			COALESCE(ns.stake, 0)::text AS stake_tao,
-			COALESCE(pmq.prism_final_score, o.prism_final_score, 0)::text AS prism_final_score,
+			COALESCE(pmq.performance_score, 0)::text AS performance_score,
+			COALESCE(pmq.readiness_active_time_multiplier, 1)::text AS readiness_active_time_multiplier,
 			o.prism_pool::text AS prism_pool,
 			COALESCE(pmq.throughput_score,   0)::text AS throughput_score,
 			COALESCE(pmq.reliability_score,  0)::text AS reliability_score,
-			COALESCE(pmq.performance_score,  0)::text AS performance_score,
 			COALESCE(pmq.penalty_multiplier, 1)::text AS penalty_multiplier,
 			COALESCE(pmq.verified_task_count, 0)::text AS task_done_count
 		FROM core.orchestrators o
@@ -136,7 +101,9 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 	`;
 
 	const rawScores = rows.map((r) => {
-		const prism = Number(r.prism_final_score);
+		const prism = Number(r.performance_score)
+			* Number(r.readiness_active_time_multiplier)
+			* Number(r.penalty_multiplier);
 		const taskDone = Number(r.task_done_count);
 		const raw = computeRawScore(prism, taskDone);
 		return { row: r, prism, taskDone, raw };
@@ -254,7 +221,7 @@ export const epochSummary: EpochSummaryJob = async ({ db }) => {
 				updated_at                   = NOW()
 		`;
 
-		// Retention: remove epochs older than about 30 days.
+		// Retention: remove epochs older than ~30 days.
 		await sql`
 			DELETE FROM core.epoch_summary
 			WHERE netuid = ${env.METAGRAPH_NETUID}

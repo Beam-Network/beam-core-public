@@ -1,8 +1,3 @@
-/**
- * PRISM score computation for orchestrator throughput, reliability, readiness, penalties, and confidence.
- *
- * Self-contained transparency copy of the production scoring module in beam-core.
- */
 export interface PrismTaskHourBucket {
 	bucketStart: Date;
 	verified_task_count: number;
@@ -24,6 +19,14 @@ export interface PenaltyCoefficients {
 export interface PrismReadinessSnapshot {
 	ready: boolean;
 	controlPlaneConnected: boolean;
+	activeTimeMultiplier?: number;
+}
+
+export interface PrismReadinessEvent {
+	eventAt: Date;
+	ready: boolean;
+	controlPlaneConnected: boolean;
+	active?: boolean;
 }
 
 export interface FleetMetricRange {
@@ -71,6 +74,7 @@ export interface PrismScoreResult {
 	rawReliability: number;
 	performanceScore: number;
 	readinessMultiplier: number;
+	readinessActiveTimeMultiplier: number;
 	penaltyMultiplier: number;
 	confidenceScore: number;
 	prismFinalScore: number;
@@ -89,7 +93,8 @@ export interface PrismScoreResult {
 }
 
 export const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 7;
-export const HALF_LIFE_HOURS = 48;
+export const RELIABILITY_HALF_LIFE_HOURS = 24;
+export const PENALTY_HALF_LIFE_HOURS = 48;
 export const DEFAULT_GRADUATION_CONFIDENCE = 0.9;
 
 export function resolveNewPool(
@@ -116,7 +121,72 @@ function round(value: number, digits = 5): number {
 	return Number(value.toFixed(digits));
 }
 
-export function sampleWeight(sampleAt: Date, now: Date, halfLifeHours = HALF_LIFE_HOURS): number {
+function readinessEventActive(event: PrismReadinessEvent): boolean {
+	return event.active ?? (event.ready && event.controlPlaneConnected);
+}
+
+export function computeReadinessActiveTimeMultiplier(input: {
+	events: PrismReadinessEvent[];
+	current: PrismReadinessSnapshot;
+	lookbackDays: number;
+	registeredAt?: Date;
+	now: Date;
+}): number {
+	const windowMs = Math.max(1, input.lookbackDays) * 24 * 60 * 60 * 1000;
+	const nowMs = input.now.getTime();
+	const lookbackStartMs = nowMs - windowMs;
+	const registrationMs = input.registeredAt?.getTime();
+	const hasRegistrationCap = Number.isFinite(registrationMs) && registrationMs! > lookbackStartMs;
+	const baseWindowStartMs = hasRegistrationCap
+		? Math.min(nowMs, registrationMs!)
+		: lookbackStartMs;
+	const events = input.events
+		.filter((event) => Number.isFinite(event.eventAt.getTime()) && event.eventAt.getTime() <= nowMs)
+		.sort((left, right) => left.eventAt.getTime() - right.eventAt.getTime());
+
+	if (events.length === 0 || baseWindowStartMs >= nowMs) {
+		return input.current.ready && input.current.controlPlaneConnected ? 1 : 0;
+	}
+
+	let effectiveWindowStartMs = baseWindowStartMs;
+	let state: boolean | null = null;
+	let startIndex = 0;
+	for (const [index, event] of events.entries()) {
+		const eventMs = event.eventAt.getTime();
+		if (eventMs <= baseWindowStartMs) {
+			state = readinessEventActive(event);
+			startIndex = index + 1;
+			continue;
+		}
+		if (state === null) {
+			effectiveWindowStartMs = eventMs;
+			state = readinessEventActive(event);
+			startIndex = index + 1;
+		}
+		break;
+	}
+
+	if (state === null || effectiveWindowStartMs >= nowMs) {
+		return input.current.ready && input.current.controlPlaneConnected ? 1 : 0;
+	}
+
+	const denominatorMs = Math.max(1, nowMs - effectiveWindowStartMs);
+	let cursorMs = effectiveWindowStartMs;
+	let activeMs = 0;
+	for (const event of events.slice(startIndex)) {
+		const eventMs = event.eventAt.getTime();
+		if (eventMs <= effectiveWindowStartMs) continue;
+		if (eventMs > nowMs) break;
+		if (state) activeMs += Math.max(0, eventMs - cursorMs);
+		state = readinessEventActive(event);
+		cursorMs = Math.max(cursorMs, eventMs);
+	}
+
+	if (state) activeMs += Math.max(0, nowMs - cursorMs);
+	return clamp(activeMs / denominatorMs);
+}
+
+export function sampleWeight(sampleAt: Date, now: Date, halfLifeHours: number): number {
 	const ageMs = Math.max(0, now.getTime() - sampleAt.getTime());
 	const ageHours = ageMs / (1000 * 60 * 60);
 	return Math.pow(0.5, ageHours / halfLifeHours);
@@ -173,7 +243,7 @@ function reliabilityScore(
 	let overseerInterventionWeight = 0;
 
 	for (const bucket of buckets) {
-		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now);
+		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now, RELIABILITY_HALF_LIFE_HOURS);
 		verifiedWeight += bucket.verified_task_count * weight;
 		failedTaskWeight += bucket.failed_task_count * weight;
 		overseerInterventionWeight += bucket.overseer_intervention_count * weight;
@@ -205,10 +275,25 @@ function reliabilityScore(
 	};
 }
 
-function readinessMultiplier(readiness: PrismReadinessSnapshot): { multiplier: number; reason: string } {
-	if (!readiness.controlPlaneConnected) return { multiplier: 0, reason: "disconnected" };
-	if (!readiness.ready) return { multiplier: 0, reason: "not_ready" };
-	return { multiplier: 1, reason: "ready" };
+function readinessMultiplier(readiness: PrismReadinessSnapshot): {
+	multiplier: number;
+	activeTimeMultiplier: number;
+	currentMultiplier: number;
+	reason: string;
+} {
+	const activeTimeMultiplier = clamp(readiness.activeTimeMultiplier ?? 1);
+	if (!readiness.controlPlaneConnected) {
+		return { multiplier: 0, activeTimeMultiplier, currentMultiplier: 0, reason: "disconnected" };
+	}
+	if (!readiness.ready) {
+		return { multiplier: 0, activeTimeMultiplier, currentMultiplier: 0, reason: "not_ready" };
+	}
+	return {
+		multiplier: activeTimeMultiplier,
+		activeTimeMultiplier,
+		currentMultiplier: 1,
+		reason: "ready",
+	};
 }
 
 function decayedPenaltyPressure(
@@ -219,7 +304,7 @@ function decayedPenaltyPressure(
 	let pressure = 0;
 	let eventCount = 0;
 	for (const bucket of buckets) {
-		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now);
+		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now, PENALTY_HALF_LIFE_HOURS);
 		pressure += coefficients.fraud * bucket.fraud_penalty_count * weight;
 		pressure += coefficients.sybil * bucket.sybil_penalty_count * weight;
 		eventCount += bucket.fraud_penalty_count + bucket.sybil_penalty_count;
@@ -328,6 +413,7 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 		rawReliability: round(reliability.reliability),
 		performanceScore: round(performanceScore),
 		readinessMultiplier: round(readiness.multiplier),
+		readinessActiveTimeMultiplier: round(readiness.activeTimeMultiplier),
 		penaltyMultiplier: round(penalty.multiplier),
 		confidenceScore: round(confidence.score, 4),
 		prismFinalScore: round(finalScore),

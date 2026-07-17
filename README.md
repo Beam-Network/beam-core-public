@@ -8,7 +8,7 @@ These files are maintained as self-contained public copies of the current BeamCo
 
 | Path | Description |
 |------|-------------|
-| `packages/core-server/src/control-plane/assignment-engine.ts` | Assignment pipeline and inlined helpers used in production. |
+| `packages/transfer-runtime/src/transfer-runtime/assignment-engine.ts` | Assignment and recovery allocation pipeline used in production. |
 | `packages/ops-scheduler/src/prism/scoring.ts` | PRISM score computation. |
 | `packages/ops-scheduler/src/jobs/prism-score-updater.ts` | Job that aggregates DB inputs and updates PRISM metrics. |
 | `packages/ops-scheduler/src/jobs/epoch-summary.ts` | Job that converts qualified PRISM scores and completed production tasks from the PRISM evidence window into validator weights. |

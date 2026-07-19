@@ -1,4 +1,5 @@
 import type { JobFn } from "../runner.js";
+import type { Db } from "../db/client.js";
 import { logger as baseLogger } from "../logger.js";
 import { env } from "../config.js";
 import {
@@ -20,6 +21,7 @@ import {
 	indexPrismEvidence,
 	indexReadinessActiveTime,
 	loadReadinessEvents,
+	markPrismPoolTransitionPending,
 	mirrorOrchestratorRoutingScore,
 	persistQualifyingMetrics,
 	persistQualifiedMetrics,
@@ -57,10 +59,11 @@ function promotionSeededScore(score: PrismScoreResult): PreparedPrismScore {
 function prepareScoreForRouting(
 	orchestrator: OrchestratorPrismRow,
 	score: PrismScoreResult,
+	options: { allowQualifiedTransitionScore?: boolean } = {},
 ): PreparedPrismScore {
 	if (
 		orchestrator.prism_pool === "qualified" &&
-		orchestrator.prism_pool_transition_pending &&
+		options.allowQualifiedTransitionScore === true &&
 		hasEmptyQualifiedTaskEvidence(score)
 	) {
 		return promotionSeededScore(score);
@@ -78,7 +81,15 @@ function hasEmptyQualifiedTaskEvidence(score: PrismScoreResult): boolean {
 		&& score.verifiedBandwidthMbps === 0;
 }
 
-export const prismScoreUpdater: JobFn = async ({ db }) => {
+function hasPositiveQualifiedTaskEvidence(score: PrismScoreResult): boolean {
+	return !hasEmptyQualifiedTaskEvidence(score);
+}
+
+function hasEmptyLifetimeEvidence(input: { lifetimeVerifiedTaskCount: number; lifetimeVerifiedTransferCount: number }): boolean {
+	return input.lifetimeVerifiedTaskCount === 0 && input.lifetimeVerifiedTransferCount === 0;
+}
+
+export async function refreshPrismScores(db: Db): Promise<void> {
 	const now = new Date();
 	const rawConfig = await loadPrismConfig(db);
 	const config = rawConfig ?? {
@@ -251,11 +262,23 @@ export const prismScoreUpdater: JobFn = async ({ db }) => {
 			},
 		);
 		const score = computePrismScore(scoreInput);
-		const { persistedScore, routingScore } = prepareScoreForRouting(orchestrator, score);
+		const emptyQualifiedEvidence = hasEmptyQualifiedTaskEvidence(score);
+		const emptyLifetimeEvidence = hasEmptyLifetimeEvidence(scoreInput);
+		const transitionAlreadyPending = orchestrator.prism_pool_transition_pending === true;
+		const allowQualifiedTransitionScore = emptyQualifiedEvidence
+			&& (
+				emptyLifetimeEvidence
+				|| transitionAlreadyPending
+			);
+		const { persistedScore, routingScore } = prepareScoreForRouting(orchestrator, score, { allowQualifiedTransitionScore });
 		await persistQualifiedMetrics(db, orchestrator.id, persistedScore);
 		await mirrorOrchestratorRoutingScore(db, orchestrator, routingScore, false);
-		if (orchestrator.prism_pool_transition_pending && score.verifiedTaskCount > 0) {
+		if (allowQualifiedTransitionScore && !orchestrator.prism_pool_transition_pending) {
+			await markPrismPoolTransitionPending(db, orchestrator.id);
+			orchestrator.prism_pool_transition_pending = true;
+		} else if (orchestrator.prism_pool_transition_pending && (!allowQualifiedTransitionScore || hasPositiveQualifiedTaskEvidence(score))) {
 			await clearPrismPoolTransitionPending(db, orchestrator.id);
+			orchestrator.prism_pool_transition_pending = false;
 		}
 	}
 
@@ -275,4 +298,8 @@ export const prismScoreUpdater: JobFn = async ({ db }) => {
 	} catch (err) {
 		logger.warn({ err }, "failed to sync PRISM routing snapshot to transfer runtime");
 	}
+}
+
+export const prismScoreUpdater: JobFn = async ({ db }) => {
+	await refreshPrismScores(db);
 };

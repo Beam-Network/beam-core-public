@@ -1054,7 +1054,11 @@ export class AssignmentEngine {
 
 	private refreshAssignmentLedgerEligibility(state: TransferAssignmentLedgerState): void {
 		const unavailable = state.ledger.candidateList()
-			.map((candidate) => ({ candidate, reason: orchestratorUnavailableReason(candidate.hotkey) }))
+			.map((candidate) => ({
+				candidate,
+				reason: orchestratorUnavailableReason(candidate.hotkey)
+					?? (this.routingRegistry.getByHotkey(candidate.hotkey)?.uid == null ? "uid_deregistered" : null),
+			}))
 			.filter((entry): entry is { candidate: OrchestratorCandidate; reason: string } => entry.reason != null);
 		if (!unavailable.length) return;
 		const redistributed = state.ledger.removeCandidates(
@@ -1197,7 +1201,8 @@ export class AssignmentEngine {
 
 			const candidateChunks = shuffledChunkIndices(chunkIndices).slice(0, assignableCount);
 			const ownerGroupByOrchestratorId = new Map(
-				this.routingRegistry.listReadyCandidates([], []).map((candidate) => [candidate.id, candidate.owner_group_id]),
+				// full snapshot: exclusions must also cover no-longer-eligible orchestrators
+				this.routingRegistry.listSnapshot().map((record) => [record.id, record.owner_group_id]),
 			);
 			const batchRows = options?.relaxExclusions || !input.excludeOrchestratorIdsByChunk?.size
 				? mapChunkBundleToRows(candidateChunks, selection.orchestrators, plannedSliceSizes)

@@ -105,7 +105,8 @@ export const epochSummary: JobFn = async ({ db }) => {
 			* Number(r.readiness_active_time_multiplier)
 			* Number(r.penalty_multiplier);
 		const taskDone = Number(r.task_done_count);
-		const raw = computeRawScore(prism, taskDone);
+		const penaltyMultiplier = Number(r.penalty_multiplier);
+		const raw = computeRawScore(taskDone, penaltyMultiplier);
 		return { row: r, prism, taskDone, raw };
 	});
 

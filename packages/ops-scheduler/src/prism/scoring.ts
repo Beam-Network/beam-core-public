@@ -8,11 +8,13 @@ export interface PrismTaskHourBucket {
 export interface PrismPenaltyHourBucket {
 	bucketStart: Date;
 	fraud_penalty_count: number;
+	integrity_chunk_mismatch_count: number;
 	sybil_penalty_count: number;
 }
 
 export interface PenaltyCoefficients {
 	fraud: number;
+	integrityChunkMismatch: number;
 	sybil: number;
 }
 
@@ -306,12 +308,13 @@ function decayedPenaltyPressure(
 	for (const bucket of buckets) {
 		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now, PENALTY_HALF_LIFE_HOURS);
 		pressure += coefficients.fraud * bucket.fraud_penalty_count * weight;
+		pressure += coefficients.integrityChunkMismatch * bucket.integrity_chunk_mismatch_count * weight;
 		pressure += coefficients.sybil * bucket.sybil_penalty_count * weight;
-		eventCount += bucket.fraud_penalty_count + bucket.sybil_penalty_count;
+		eventCount += bucket.fraud_penalty_count + bucket.integrity_chunk_mismatch_count + bucket.sybil_penalty_count;
 	}
 	return {
 		pressure,
-		multiplier: clamp(1 - pressure, 0.2, 1),
+		multiplier: clamp(1 - pressure, 0, 1),
 		eventCount,
 	};
 }

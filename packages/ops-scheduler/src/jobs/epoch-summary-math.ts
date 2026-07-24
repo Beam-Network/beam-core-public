@@ -1,11 +1,11 @@
 /**
  * Pure helpers for epoch summary weights (testable, no DB).
- * raw_i = weight_prism_score_i x task_done_count_i, where weight_prism_score is
- * performance_score x readiness_active_time_multiplier x penalty_multiplier and task_done_count_i is
- * the completed production task count in the PRISM evidence window; tiered weights sum to 1 when raw work exists.
+ * raw_i = task_done_count_i * penalty_multiplier_i, where task_done_count_i is
+ * the completed production task count in the PRISM evidence window; tiered
+ * weights sum to 1 when raw work exists.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_prism_score_x_prism_evidence_tasks_v2";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_task_done_x_penalty_based";
 
 export type EmissionTier = "A" | "B" | "C";
 
@@ -32,10 +32,10 @@ export interface TieredWeightResult {
 	effectiveTierShares: Record<EmissionTier, number>;
 }
 
-export function computeRawScore(prismFinalScore: number, taskDoneCount: number): number {
-	const p = Number.isFinite(prismFinalScore) ? prismFinalScore : 0;
+export function computeRawScore(taskDoneCount: number, penaltyMultiplier: number): number {
 	const t = Number.isFinite(taskDoneCount) ? taskDoneCount : 0;
-	return Math.max(0, p * t);
+	const p = Number.isFinite(penaltyMultiplier) ? penaltyMultiplier : 0;
+	return Math.max(0, t) * Math.max(0, p);
 }
 
 function safeScore(value: number): number {

@@ -1,11 +1,11 @@
 /**
  * Pure helpers for epoch summary weights (testable, no DB).
- * raw_i = task_done_count_i * penalty_multiplier_i, where task_done_count_i is
- * the completed production task count in the PRISM evidence window; tiered
+ * raw_i = verified_uploaded_bytes_i * penalty_multiplier_i, where verified_uploaded_bytes_i is
+ * the completed production upload byte total in the PRISM evidence window; tiered
  * weights sum to 1 when raw work exists.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_task_done_x_penalty_based";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_bytes_x_penalty_based";
 
 export type EmissionTier = "A" | "B" | "C";
 
@@ -19,7 +19,7 @@ export interface TieredWeightInput {
 	uid: number | null;
 	hotkey: string;
 	prismFinalScore: number;
-	taskDoneCount: number;
+	verifiedUploadedBytes: number;
 	rawScore: number;
 }
 
@@ -32,10 +32,10 @@ export interface TieredWeightResult {
 	effectiveTierShares: Record<EmissionTier, number>;
 }
 
-export function computeRawScore(taskDoneCount: number, penaltyMultiplier: number): number {
-	const t = Number.isFinite(taskDoneCount) ? taskDoneCount : 0;
+export function computeRawScore(verifiedUploadedBytes: number, penaltyMultiplier: number): number {
+	const b = Number.isFinite(verifiedUploadedBytes) ? verifiedUploadedBytes : 0;
 	const p = Number.isFinite(penaltyMultiplier) ? penaltyMultiplier : 0;
-	return Math.max(0, t) * Math.max(0, p);
+	return Math.max(0, b) * Math.max(0, p);
 }
 
 function safeScore(value: number): number {
@@ -82,13 +82,13 @@ export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[
 			index,
 			rawScore: safeScore(candidate.rawScore),
 			prismFinalScore: safeScore(candidate.prismFinalScore),
-			taskDoneCount: safeScore(candidate.taskDoneCount),
+			verifiedUploadedBytes: safeScore(candidate.verifiedUploadedBytes),
 		}))
 		.sort(
 			(left, right) =>
 				right.rawScore - left.rawScore ||
 				right.prismFinalScore - left.prismFinalScore ||
-				right.taskDoneCount - left.taskDoneCount ||
+				right.verifiedUploadedBytes - left.verifiedUploadedBytes ||
 				compareUidAscNullsLast(left.uid, right.uid) ||
 				left.hotkey.localeCompare(right.hotkey) ||
 				left.index - right.index,

@@ -29,6 +29,7 @@ interface OrchRow {
 	readiness_active_time_multiplier: string;
 	penalty_multiplier: string;
 	task_done_count: string;
+	verified_uploaded_bytes: string;
 }
 
 
@@ -63,11 +64,11 @@ export const epochSummary: JobFn = async ({ db }) => {
 		for (let e = startEpoch; e < epoch; e++) {
 			await db`
 				INSERT INTO core.epoch_summary_totals
-					(netuid, epoch, sum_raw_weight, sum_task_done_count, qualified_orchestrator_count,
+					(netuid, epoch, sum_raw_weight, sum_task_done_count, sum_verified_uploaded_bytes, qualified_orchestrator_count,
 					 all_weights_zero, current_block, blocks_per_epoch,
 					 formula_version, source, created_at, updated_at)
 				VALUES
-					(${env.METAGRAPH_NETUID}, ${e}, 0, 0, 0,
+					(${env.METAGRAPH_NETUID}, ${e}, 0, 0, 0, 0,
 					 TRUE, ${Number(chain.current_block)}, ${chain.blocks_per_epoch},
 					 ${PRISM_WEIGHT_FORMULA_VERSION}, 'epoch_summary_backfill', NOW(), NOW())
 				ON CONFLICT (netuid, epoch) DO NOTHING
@@ -91,7 +92,8 @@ export const epochSummary: JobFn = async ({ db }) => {
 			COALESCE(pmq.throughput_score,   0)::text AS throughput_score,
 			COALESCE(pmq.reliability_score,  0)::text AS reliability_score,
 			COALESCE(pmq.penalty_multiplier, 1)::text AS penalty_multiplier,
-			COALESCE(pmq.verified_task_count, 0)::text AS task_done_count
+			COALESCE(pmq.verified_task_count, 0)::text AS task_done_count,
+			COALESCE(pmq.verified_uploaded_bytes, 0)::text AS verified_uploaded_bytes
 		FROM core.orchestrators o
 		INNER JOIN core.prism_metrics_qualified pmq ON pmq.orchestrator_id = o.id
 		LEFT JOIN core.neuron_state ns ON ns.netuid = ${env.METAGRAPH_NETUID} AND ns.hotkey = o.hotkey
@@ -105,21 +107,22 @@ export const epochSummary: JobFn = async ({ db }) => {
 			* Number(r.readiness_active_time_multiplier)
 			* Number(r.penalty_multiplier);
 		const taskDone = Number(r.task_done_count);
+		const verifiedUploadedBytes = Number(r.verified_uploaded_bytes);
 		const penaltyMultiplier = Number(r.penalty_multiplier);
-		const raw = computeRawScore(taskDone, penaltyMultiplier);
-		return { row: r, prism, taskDone, raw };
+		const raw = computeRawScore(verifiedUploadedBytes, penaltyMultiplier);
+		return { row: r, prism, taskDone, verifiedUploadedBytes, raw };
 	});
 
-	const tierInputs = rawScores.map(({ row, prism, taskDone, raw }) => ({
+	const tierInputs = rawScores.map(({ row, prism, verifiedUploadedBytes, raw }) => ({
 		uid: row.uid,
 		hotkey: row.hotkey,
 		prismFinalScore: prism,
-		taskDoneCount: taskDone,
+		verifiedUploadedBytes,
 		rawScore: raw,
 	}));
 	const { weights: normalizedList, sumRaw } = normalizeWeightsWithEmissionTiers(tierInputs);
 
-	const orchestrators = rawScores.map(({ row, prism, taskDone, raw }, idx) => ({
+	const orchestrators = rawScores.map(({ row, prism, taskDone, verifiedUploadedBytes, raw }, idx) => ({
 		id: row.id,
 		hotkey: row.hotkey,
 		uid: row.uid,
@@ -131,12 +134,14 @@ export const epochSummary: JobFn = async ({ db }) => {
 		performance_score: Number(row.performance_score),
 		penalty_multiplier: Number(row.penalty_multiplier),
 		task_done_count: taskDone,
+		verified_uploaded_bytes: verifiedUploadedBytes,
 		raw_weight: raw,
 		normalized_weight: normalizedList[idx] ?? 0,
 		uint16_weight: toUint16Weight(normalizedList[idx] ?? 0),
 	}));
 
 	const sumTaskDone = orchestrators.reduce((s, o) => s + o.task_done_count, 0);
+	const sumVerifiedUploadedBytes = orchestrators.reduce((s, o) => s + o.verified_uploaded_bytes, 0);
 	const allWeightsZero = sumRaw === 0;
 	const retentionCount = epochRetentionCount(chain.blocks_per_epoch);
 
@@ -146,7 +151,7 @@ export const epochSummary: JobFn = async ({ db }) => {
 			await sql`
 				INSERT INTO core.epoch_summary
 					(netuid, epoch, orchestrator_id, orchestrator_uid, orchestrator_hotkey,
-					 stake_tao, prism_final_score, task_done_count,
+					 stake_tao, prism_final_score, task_done_count, verified_uploaded_bytes,
 					 raw_weight, normalized_weight, uint16_weight,
 					 throughput_score, reliability_score, performance_score, penalty_multiplier,
 					 prism_pool, formula_version, source, created_at, updated_at)
@@ -159,7 +164,8 @@ export const epochSummary: JobFn = async ({ db }) => {
 					x.stake_tao::NUMERIC(20,6),
 					x.prism_final_score::NUMERIC(6,5),
 					x.task_done_count::INT,
-					x.raw_weight::NUMERIC(12,6),
+					x.verified_uploaded_bytes::BIGINT,
+					x.raw_weight::NUMERIC(30,6),
 					x.normalized_weight::NUMERIC(12,10),
 					x.uint16_weight::INT,
 					x.throughput_score::NUMERIC(6,5),
@@ -174,6 +180,7 @@ export const epochSummary: JobFn = async ({ db }) => {
 				FROM jsonb_to_recordset(${sql.json(orchestrators as never)}) AS x(
 					id TEXT, hotkey TEXT, uid INT,
 					stake_tao FLOAT8, prism_final_score FLOAT8, task_done_count INT,
+					verified_uploaded_bytes BIGINT,
 					raw_weight FLOAT8, normalized_weight FLOAT8, uint16_weight INT,
 					throughput_score FLOAT8, reliability_score FLOAT8,
 					performance_score FLOAT8, penalty_multiplier FLOAT8,
@@ -185,6 +192,7 @@ export const epochSummary: JobFn = async ({ db }) => {
 					stake_tao           = EXCLUDED.stake_tao,
 					prism_final_score   = EXCLUDED.prism_final_score,
 					task_done_count     = EXCLUDED.task_done_count,
+					verified_uploaded_bytes = EXCLUDED.verified_uploaded_bytes,
 					raw_weight          = EXCLUDED.raw_weight,
 					normalized_weight   = EXCLUDED.normalized_weight,
 					uint16_weight       = EXCLUDED.uint16_weight,
@@ -202,17 +210,18 @@ export const epochSummary: JobFn = async ({ db }) => {
 		// Upsert epoch totals.
 		await sql`
 			INSERT INTO core.epoch_summary_totals
-				(netuid, epoch, sum_raw_weight, sum_task_done_count, qualified_orchestrator_count,
+				(netuid, epoch, sum_raw_weight, sum_task_done_count, sum_verified_uploaded_bytes, qualified_orchestrator_count,
 				 all_weights_zero, current_block, blocks_per_epoch,
 				 formula_version, source, created_at, updated_at)
 			VALUES
 				(${env.METAGRAPH_NETUID}, ${epoch},
-				 ${sumRaw}, ${sumTaskDone}, ${orchestrators.length},
+				 ${sumRaw}, ${sumTaskDone}, ${sumVerifiedUploadedBytes}, ${orchestrators.length},
 				 ${allWeightsZero}, ${Number(chain.current_block)}, ${chain.blocks_per_epoch},
 				 ${PRISM_WEIGHT_FORMULA_VERSION}, 'epoch_summary', NOW(), NOW())
 			ON CONFLICT (netuid, epoch) DO UPDATE SET
 				sum_raw_weight               = EXCLUDED.sum_raw_weight,
 				sum_task_done_count          = EXCLUDED.sum_task_done_count,
+				sum_verified_uploaded_bytes  = EXCLUDED.sum_verified_uploaded_bytes,
 				qualified_orchestrator_count = EXCLUDED.qualified_orchestrator_count,
 				all_weights_zero             = EXCLUDED.all_weights_zero,
 				current_block                = EXCLUDED.current_block,

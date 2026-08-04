@@ -1,3 +1,5 @@
+
+
 export interface PrismTaskHourBucket {
 	bucketStart: Date;
 	verified_task_count: number;
@@ -42,21 +44,23 @@ export interface PerformanceWeights {
 }
 
 export interface PrismScoreInput {
-	// pre-aggregated from prism_evidence_hourly (within lookback window)
+
 	verifiedTaskCount: number;
+	verifiedUploadedMib: number;
 	verifiedTransferCount: number;
 	averageVerifiedMbps: number;
-	// per-hour buckets for time-decay scoring
+
 	taskHourBuckets: PrismTaskHourBucket[];
 	penaltyHourBuckets: PrismPenaltyHourBucket[];
-	// lifetime (from prism_evidence_totals)
+
 	lifetimeVerifiedTaskCount: number;
 	lifetimeVerifiedTransferCount: number;
-	// fleet ranges
+
 	throughputRange: FleetMetricRange;
 	reliabilityRange: FleetMetricRange;
-	// scoring params
+
 	penaltyCoefficients: PenaltyCoefficients;
+	penaltyHalfLifeHours?: number;
 	readiness: PrismReadinessSnapshot;
 	evidenceLookbackDays?: number;
 	confidenceTargets?: {
@@ -82,6 +86,7 @@ export interface PrismScoreResult {
 	prismFinalScore: number;
 	verifiedTransferCount: number;
 	verifiedTaskCount: number;
+	verifiedUploadedMib: number;
 	lifetimeVerifiedTaskCount: number;
 	verifiedBandwidthMbps: number;
 	prismPool: "qualifying" | "qualified";
@@ -96,7 +101,7 @@ export interface PrismScoreResult {
 
 export const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 7;
 export const RELIABILITY_HALF_LIFE_HOURS = 24;
-export const PENALTY_HALF_LIFE_HOURS = 48;
+export const DEFAULT_PENALTY_HALF_LIFE_HOURS = 0;
 export const DEFAULT_GRADUATION_CONFIDENCE = 0.9;
 
 export function resolveNewPool(
@@ -112,7 +117,7 @@ const DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS = 120;
 const DEFAULT_AGE_SATURATION_DAYS = 7;
 export const DEFAULT_PERFORMANCE_THROUGHPUT_WEIGHT = 0.4;
 export const DEFAULT_PERFORMANCE_RELIABILITY_WEIGHT = 0.6;
-/** Lowest normalized fleet score for orchestrators with positive evidence (linear spread up to 1). */
+
 export const FLEET_NORMALIZATION_FLOOR = 0.2;
 
 function clamp(value: number, min = 0, max = 1): number {
@@ -194,7 +199,6 @@ export function sampleWeight(sampleAt: Date, now: Date, halfLifeHours: number): 
 	return Math.pow(0.5, ageHours / halfLifeHours);
 }
 
-/** Returns the UTC half-hour point used as the representative decay anchor per hourly bucket. */
 export function hourMidpoint(bucketStart: Date): Date {
 	const d = new Date(bucketStart);
 	d.setUTCMinutes(30, 0, 0);
@@ -298,15 +302,19 @@ function readinessMultiplier(readiness: PrismReadinessSnapshot): {
 	};
 }
 
-function decayedPenaltyPressure(
+function penaltyPressure(
 	buckets: PrismPenaltyHourBucket[],
 	coefficients: PenaltyCoefficients,
+	penaltyHalfLifeHours: number,
 	now: Date,
 ): { multiplier: number; pressure: number; eventCount: number } {
 	let pressure = 0;
 	let eventCount = 0;
+	const halfLifeHours = Math.max(0, penaltyHalfLifeHours);
 	for (const bucket of buckets) {
-		const weight = sampleWeight(hourMidpoint(bucket.bucketStart), now, PENALTY_HALF_LIFE_HOURS);
+		const weight = halfLifeHours > 0
+			? sampleWeight(hourMidpoint(bucket.bucketStart), now, halfLifeHours)
+			: 1;
 		pressure += coefficients.fraud * bucket.fraud_penalty_count * weight;
 		pressure += coefficients.integrityChunkMismatch * bucket.integrity_chunk_mismatch_count * weight;
 		pressure += coefficients.sybil * bucket.sybil_penalty_count * weight;
@@ -369,7 +377,12 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 			normalizedReliability.score * performanceWeights.reliability,
 	);
 	const readiness = readinessMultiplier(input.readiness);
-	const penalty = decayedPenaltyPressure(input.penaltyHourBuckets, input.penaltyCoefficients, input.now);
+	const penalty = penaltyPressure(
+		input.penaltyHourBuckets,
+		input.penaltyCoefficients,
+		input.penaltyHalfLifeHours ?? DEFAULT_PENALTY_HALF_LIFE_HOURS,
+		input.now,
+	);
 	const confidenceTargets = {
 		targetVerifiedTasks:
 			input.confidenceTargets?.targetVerifiedTasks ?? DEFAULT_TARGET_GRADUATION_VERIFIED_TASKS,
@@ -422,6 +435,7 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 		prismFinalScore: round(finalScore),
 		verifiedTransferCount: input.verifiedTransferCount,
 		verifiedTaskCount: input.verifiedTaskCount,
+		verifiedUploadedMib: Math.max(0, Math.floor(input.verifiedUploadedMib)),
 		lifetimeVerifiedTaskCount: input.lifetimeVerifiedTaskCount,
 		verifiedBandwidthMbps: round(input.averageVerifiedMbps, 2),
 		prismPool,

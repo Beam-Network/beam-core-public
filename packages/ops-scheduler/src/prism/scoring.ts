@@ -99,8 +99,8 @@ export interface PrismScoreResult {
 	routingAppliedScore: number | null;
 }
 
-export const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 7;
-export const RELIABILITY_HALF_LIFE_HOURS = 24;
+export const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 1;
+export const RELIABILITY_HALF_LIFE_HOURS = 1;
 export const DEFAULT_PENALTY_HALF_LIFE_HOURS = 0;
 export const DEFAULT_GRADUATION_CONFIDENCE = 0.9;
 

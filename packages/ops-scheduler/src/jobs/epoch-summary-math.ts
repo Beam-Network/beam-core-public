@@ -5,14 +5,16 @@
  * weights sum to 1 when raw work exists.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_based";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_v2";
 
-export type EmissionTier = "A" | "B" | "C";
+export type EmissionTier = "A" | "B" | "C" | "D" | "E";
 
 const TIER_SHARES: Record<EmissionTier, number> = {
-	A: 0.8,
-	B: 0.15,
-	C: 0.05,
+	A: 0.5,
+	B: 0.35,
+	C: 0.1,
+	D: 0.04,
+	E: 0.01,
 };
 
 export interface TieredWeightInput {
@@ -50,30 +52,34 @@ function compareUidAscNullsLast(a: number | null, b: number | null): number {
 }
 
 function computeTierCounts(count: number): Record<EmissionTier, number> {
-	if (count <= 0) return { A: 0, B: 0, C: 0 };
-	const a = Math.min(count, Math.ceil(count * 0.1));
-	const b = Math.min(count - a, Math.ceil(count * 0.3));
-	return { A: a, B: b, C: count - a - b };
+	if (count <= 0) return { A: 0, B: 0, C: 0, D: 0, E: 0 };
+	const a = Math.min(count, 30);
+	const b = Math.min(count - a, 30);
+	const c = Math.min(count - a - b, 20);
+	const d = Math.min(count - a - b - c, 20);
+	return { A: a, B: b, C: c, D: d, E: count - a - b - c - d };
 }
 
 function tierForRank(rank: number, counts: Record<EmissionTier, number>): EmissionTier {
 	if (rank < counts.A) return "A";
 	if (rank < counts.A + counts.B) return "B";
-	return "C";
+	if (rank < counts.A + counts.B + counts.C) return "C";
+	if (rank < counts.A + counts.B + counts.C + counts.D) return "D";
+	return "E";
 }
 
 /**
  * Maps base raw scores to tiered normalized weights.
  *
  * Tier membership is based on base_raw descending with deterministic tie-breakers.
- * Tier B/C shares roll up to Tier A when that tier has no positive raw score.
+ * Tier B/C/D/E shares roll up to Tier A when that tier has no positive raw score.
  */
 export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[]): TieredWeightResult {
 	const n = candidates.length;
 	const weights = new Array<number>(n).fill(0);
-	const tiers = new Array<EmissionTier>(n).fill("C");
+	const tiers = new Array<EmissionTier>(n).fill("E");
 	const tierCounts = computeTierCounts(n);
-	const tierRawTotals: Record<EmissionTier, number> = { A: 0, B: 0, C: 0 };
+	const tierRawTotals: Record<EmissionTier, number> = { A: 0, B: 0, C: 0, D: 0, E: 0 };
 	const effectiveTierShares: Record<EmissionTier, number> = { ...TIER_SHARES };
 
 	const ranked = candidates
@@ -101,12 +107,12 @@ export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[
 		tierRawTotals[tier] += candidate.rawScore;
 	}
 
-	const sumRaw = tierRawTotals.A + tierRawTotals.B + tierRawTotals.C;
+	const sumRaw = tierRawTotals.A + tierRawTotals.B + tierRawTotals.C + tierRawTotals.D + tierRawTotals.E;
 	if (n === 0 || sumRaw <= 0 || tierRawTotals.A <= 0) {
 		return { weights, sumRaw, tiers, tierCounts, tierRawTotals, effectiveTierShares };
 	}
 
-	for (const tier of ["B", "C"] as const) {
+	for (const tier of ["B", "C", "D", "E"] as const) {
 		if (tierCounts[tier] === 0 || tierRawTotals[tier] <= 0) {
 			effectiveTierShares.A += TIER_SHARES[tier];
 			effectiveTierShares[tier] = 0;

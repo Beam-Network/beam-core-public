@@ -169,7 +169,7 @@ export function buildEpochSummary(input: {
 		rawWeight: rawScores[index] ?? 0,
 		normalizedWeight: normalized.weights[index] ?? 0,
 		uint16Weight: toUint16Weight(normalized.weights[index] ?? 0),
-		tier: normalized.tiers[index] ?? "C",
+		tier: normalized.tiers[index] ?? "E",
 	}));
 	return {
 		rows,

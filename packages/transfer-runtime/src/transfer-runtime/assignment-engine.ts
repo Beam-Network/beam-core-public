@@ -14,7 +14,6 @@ export interface OrchestratorCandidate {
 	hotkey: string;
 	uid: number | null;
 	prismFinalScore: number;
-	ownerGroupId?: string | null;
 }
 
 export interface CandidateAllocation {
@@ -25,15 +24,11 @@ export interface CandidateAllocation {
 export interface QualifiedAllocationPlan {
 	allocationRule: "prism_final_score_desc";
 	allocationOrder: string[];
-	ownerGroups: Array<{
-		ownerGroupId: string | null;
-		averagePrismScore: number;
+	deliveries: Array<{
+		orchestratorId: string;
+		hotkey: string;
+		prismFinalScore: number;
 		chunkCount: number;
-		members: Array<{
-			hotkey: string;
-			prismFinalScore: number;
-			chunkCount: number;
-		}>;
 	}>;
 	allocations: CandidateAllocation[];
 }
@@ -226,47 +221,20 @@ export function buildQualifiedAllocation(
 			.sort((left, right) => safeScore(right.prismFinalScore) - safeScore(left.prismFinalScore)),
 		(left, right) => safeScore(left.prismFinalScore) === safeScore(right.prismFinalScore),
 	);
-	const grouped = new Map<string, OrchestratorCandidate[]>();
-	for (const candidate of ordered) {
-		const key = candidate.ownerGroupId ?? `single:${candidate.id}`;
-		const members = grouped.get(key) ?? [];
-		members.push(candidate);
-		grouped.set(key, members);
-	}
-	const groups = [...grouped.entries()].map(([key, members]) => ({
-		ownerGroupId: key.startsWith("single:") ? null : key,
-		members,
-		averagePrismScore:
-			members.reduce((sum, member) => sum + safeScore(member.prismFinalScore), 0) / members.length,
-	}));
-	const groupSlices = computePrismSlices(groups.map((group) => group.averagePrismScore), totalChunks);
-	const allocations: CandidateAllocation[] = [];
-	const ownerGroups = groups.map((group, groupIndex) => {
-		const chunkCount = groupSlices[groupIndex] ?? 0;
-		const memberSlices = computePrismSlices(
-			group.members.map((member) => member.prismFinalScore),
-			chunkCount,
-		);
-		const members = group.members.map((member, memberIndex) => {
-			const memberChunkCount = memberSlices[memberIndex] ?? 0;
-			if (memberChunkCount > 0) allocations.push({ orchestrator: member, chunkCount: memberChunkCount });
-			return {
-				hotkey: member.hotkey,
-				prismFinalScore: safeScore(member.prismFinalScore),
-				chunkCount: memberChunkCount,
-			};
-		});
-		return {
-			ownerGroupId: group.ownerGroupId,
-			averagePrismScore: group.averagePrismScore,
-			chunkCount,
-			members,
-		};
+	const slices = computePrismSlices(ordered.map((candidate) => candidate.prismFinalScore), totalChunks);
+	const allocations = ordered.flatMap((candidate, index) => {
+		const chunkCount = slices[index] ?? 0;
+		return chunkCount > 0 ? [{ orchestrator: candidate, chunkCount }] : [];
 	});
 	return {
 		allocationRule: "prism_final_score_desc",
 		allocationOrder: ordered.map((candidate) => candidate.hotkey),
-		ownerGroups,
+		deliveries: allocations.map((allocation) => ({
+			orchestratorId: allocation.orchestrator.id,
+			hotkey: allocation.orchestrator.hotkey,
+			prismFinalScore: safeScore(allocation.orchestrator.prismFinalScore),
+			chunkCount: allocation.chunkCount,
+		})),
 		allocations,
 	};
 }
@@ -276,17 +244,12 @@ export function allocateRecoveryChunks(input: {
 	candidates: readonly OrchestratorCandidate[];
 	targetChunkCounts: readonly number[];
 	excludedOrchestratorIdsByChunk: ReadonlyMap<number, readonly string[]>;
-	excludedOwnerGroupIdsByChunk: ReadonlyMap<number, readonly string[]>;
 }): RecoveryChunkAssignment[] {
 	const assigned = new Map<string, number>();
 	const output: RecoveryChunkAssignment[] = [];
 	for (const chunkIndex of cryptographicShuffle([...new Set(input.chunkIndices)])) {
 		const excludedIds = new Set(input.excludedOrchestratorIdsByChunk.get(chunkIndex) ?? []);
-		const excludedGroups = new Set(input.excludedOwnerGroupIdsByChunk.get(chunkIndex) ?? []);
-		const eligible = input.candidates.filter((candidate) =>
-			!excludedIds.has(candidate.id)
-			&& (candidate.ownerGroupId == null || !excludedGroups.has(candidate.ownerGroupId)),
-		);
+		const eligible = input.candidates.filter((candidate) => !excludedIds.has(candidate.id));
 		if (!eligible.length) continue;
 		let lowestLoad = Number.POSITIVE_INFINITY;
 		let leastLoaded: OrchestratorCandidate[] = [];

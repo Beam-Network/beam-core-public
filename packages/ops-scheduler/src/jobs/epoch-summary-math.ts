@@ -5,7 +5,7 @@
  * weights sum to 1 when raw work exists.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_v2";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_v3";
 
 export type EmissionTier = "A" | "B" | "C" | "D" | "E";
 
@@ -55,8 +55,8 @@ function computeTierCounts(count: number): Record<EmissionTier, number> {
 	if (count <= 0) return { A: 0, B: 0, C: 0, D: 0, E: 0 };
 	const a = Math.min(count, 30);
 	const b = Math.min(count - a, 30);
-	const c = Math.min(count - a - b, 20);
-	const d = Math.min(count - a - b - c, 20);
+	const c = Math.min(count - a - b, 30);
+	const d = Math.min(count - a - b - c, 30);
 	return { A: a, B: b, C: c, D: d, E: count - a - b - c - d };
 }
 

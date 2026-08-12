@@ -7,7 +7,6 @@ import {
 	type PrismScoreResult,
 } from "../prism/scoring.js";
 
-const MS_PER_DAY = 24 * 60 * 60 * 1_000;
 const QUALIFIED_RESET_SCORE = 0.5;
 
 export const QUALIFIED_SEASONAL_RESET_OVERRIDE_REASON = "seasonal_reset_pending_qualified_evidence";
@@ -69,20 +68,6 @@ function roundScore(value: number): number {
 	return Number(value.toFixed(5));
 }
 
-export function latestSundayUtcBoundary(now: Date): Date {
-	const utcDayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-	return new Date(utcDayStart - now.getUTCDay() * MS_PER_DAY);
-}
-
-export function effectiveQualifiedResetBoundary(
-	weeklyBoundary: Date,
-	manualBoundary: Date | null,
-): Date {
-	return manualBoundary !== null && manualBoundary.getTime() > weeklyBoundary.getTime()
-		? manualBoundary
-		: weeklyBoundary;
-}
-
 function routingOverrideScore(
 	score: PrismScoreResult,
 	overrideScore: number,
@@ -140,11 +125,7 @@ export async function refreshPrismScores(
 	state: PrismRefreshState,
 	sink: PrismRefreshSink,
 ): Promise<PrismRefreshSummary> {
-	const weeklyBoundary = latestSundayUtcBoundary(state.now);
-	const resetBoundary = effectiveQualifiedResetBoundary(
-		weeklyBoundary,
-		state.manualQualifiedResetAt,
-	);
+	const resetBoundary = state.manualQualifiedResetAt;
 	const qualifying = state.orchestrators.filter((orchestrator) => orchestrator.pool === "qualifying");
 	const qualified = state.orchestrators.filter((orchestrator) => orchestrator.pool === "qualified");
 	const promotions: OrchestratorPrismSnapshot[] = [];
@@ -188,10 +169,11 @@ export async function refreshPrismScores(
 		const emptyEvidence = hasEmptyQualifiedEvidence(score);
 		const allowTransitionOverride = emptyEvidence
 			&& (hasEmptyLifetimeEvidence(scoreInput) || orchestrator.transitionPending);
-		const applyResetOverride = !hasEvidenceAtOrAfter(
-			orchestrator.latestQualifiedEvidenceAt,
-			resetBoundary,
-		);
+		const applyResetOverride = resetBoundary !== null
+			&& !hasEvidenceAtOrAfter(
+				orchestrator.latestQualifiedEvidenceAt,
+				resetBoundary,
+			);
 		if (applyResetOverride) qualifiedResetOverrides += 1;
 		const prepared = prepareQualifiedScore({
 			score,

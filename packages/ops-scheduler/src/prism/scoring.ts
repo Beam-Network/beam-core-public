@@ -51,6 +51,7 @@ export interface PrismScoreInput {
 	averageVerifiedMbps: number;
 
 	taskHourBuckets: PrismTaskHourBucket[];
+	// Active row-level penalties grouped for scoring.
 	penaltyHourBuckets: PrismPenaltyHourBucket[];
 
 	lifetimeVerifiedTaskCount: number;
@@ -60,7 +61,6 @@ export interface PrismScoreInput {
 	reliabilityRange: FleetMetricRange;
 
 	penaltyCoefficients: PenaltyCoefficients;
-	penaltyHalfLifeHours?: number;
 	readiness: PrismReadinessSnapshot;
 	evidenceLookbackDays?: number;
 	confidenceTargets?: {
@@ -101,7 +101,6 @@ export interface PrismScoreResult {
 
 export const DEFAULT_EVIDENCE_LOOKBACK_DAYS = 1;
 export const RELIABILITY_HALF_LIFE_HOURS = 1;
-export const DEFAULT_PENALTY_HALF_LIFE_HOURS = 0;
 export const DEFAULT_GRADUATION_CONFIDENCE = 0.9;
 
 export function resolveNewPool(
@@ -305,19 +304,13 @@ function readinessMultiplier(readiness: PrismReadinessSnapshot): {
 function penaltyPressure(
 	buckets: PrismPenaltyHourBucket[],
 	coefficients: PenaltyCoefficients,
-	penaltyHalfLifeHours: number,
-	now: Date,
 ): { multiplier: number; pressure: number; eventCount: number } {
 	let pressure = 0;
 	let eventCount = 0;
-	const halfLifeHours = Math.max(0, penaltyHalfLifeHours);
 	for (const bucket of buckets) {
-		const weight = halfLifeHours > 0
-			? sampleWeight(hourMidpoint(bucket.bucketStart), now, halfLifeHours)
-			: 1;
-		pressure += coefficients.fraud * bucket.fraud_penalty_count * weight;
-		pressure += coefficients.integrityChunkMismatch * bucket.integrity_chunk_mismatch_count * weight;
-		pressure += coefficients.sybil * bucket.sybil_penalty_count * weight;
+		pressure += coefficients.fraud * bucket.fraud_penalty_count;
+		pressure += coefficients.integrityChunkMismatch * bucket.integrity_chunk_mismatch_count;
+		pressure += coefficients.sybil * bucket.sybil_penalty_count;
 		eventCount += bucket.fraud_penalty_count + bucket.integrity_chunk_mismatch_count + bucket.sybil_penalty_count;
 	}
 	return {
@@ -380,8 +373,6 @@ export function computePrismScore(input: PrismScoreInput): PrismScoreResult {
 	const penalty = penaltyPressure(
 		input.penaltyHourBuckets,
 		input.penaltyCoefficients,
-		input.penaltyHalfLifeHours ?? DEFAULT_PENALTY_HALF_LIFE_HOURS,
-		input.now,
 	);
 	const confidenceTargets = {
 		targetVerifiedTasks:

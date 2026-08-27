@@ -16,6 +16,69 @@ export interface OrchestratorCandidate {
 	prismFinalScore: number;
 }
 
+export interface CapabilityProtocolRange {
+	name: string;
+	min: number;
+	max: number;
+}
+
+export interface CapabilityManifest {
+	schema_version: string;
+	actor_type: string;
+	actor_id: string;
+	software_version: string;
+	protocols: CapabilityProtocolRange[];
+	capabilities: string[];
+	capacity: {
+		max_connections: number;
+		available_connections: number;
+	};
+	observed_at: string | Date;
+	expires_at: string | Date;
+}
+
+export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
+
+function manifestTimeMs(value: string | Date): number {
+	return value instanceof Date ? value.getTime() : Date.parse(value);
+}
+
+export function supportsCapability(
+	manifest: CapabilityManifest | null | undefined,
+	capability: string,
+	now = new Date(),
+	protocolVersion = 1,
+): boolean {
+	capability = capability.trim();
+	if (!manifest || !capability) return false;
+	const expiresAtMs = manifestTimeMs(manifest.expires_at);
+	if (!Number.isFinite(expiresAtMs) || now.getTime() >= expiresAtMs) return false;
+	if (!Number.isFinite(manifest.capacity.available_connections) || manifest.capacity.available_connections <= 0) {
+		return false;
+	}
+	if (!manifest.capabilities.includes(capability)) return false;
+	return manifest.protocols.some((protocol) =>
+		protocol.name === capability && protocol.min <= protocolVersion && protocol.max >= protocolVersion
+	);
+}
+
+export function supportsNormalTransferCapability(
+	manifest: CapabilityManifest | null | undefined,
+	now = new Date(),
+	protocolVersion = 1,
+): boolean {
+	return !manifest || supportsCapability(manifest, TRANSFER_MULTIPART_CAPABILITY, now, protocolVersion);
+}
+
+export function supportsExplicitWorkloadCapability(
+	manifest: CapabilityManifest | null | undefined,
+	capability: string,
+	now = new Date(),
+	protocolVersion = 1,
+): boolean {
+	return supportsCapability(manifest, capability, now, protocolVersion);
+}
+
 export interface CandidateAllocation {
 	orchestrator: OrchestratorCandidate;
 	chunkCount: number;

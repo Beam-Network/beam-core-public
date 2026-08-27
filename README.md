@@ -1,6 +1,6 @@
 # BeamCore transparency - Task Assignment, PRISM & Weights
 
-Public reference code for three parts of BeamCore: **transfer assignment** (orchestrator selection, chunk allocation, stale reassignment), **PRISM** (scoring logic and the scheduled metrics refresh), and **validator weights** (the final epoch materialization used by validators).
+Public reference code for three parts of BeamCore: **transfer assignment** (orchestrator selection, capability eligibility, chunk allocation, stale reassignment), **PRISM** (scoring logic and the scheduled metrics refresh), and **validator weights** (the final epoch materialization used by validators).
 
 These files are maintained as self-contained public copies of the current BeamCore logic. This repository is not a runnable service; dependencies, scheduler wiring, and some modules are omitted or inlined.
 

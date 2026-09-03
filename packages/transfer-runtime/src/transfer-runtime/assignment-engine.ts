@@ -36,6 +36,8 @@ export interface CapabilityManifest {
 	observed_at: string | Date;
 }
 
+export const ROOM_TRANSFER_SCHEMA_VERSION = "room-transfer/v1";
+export const ROOM_TRANSFER_PROTOCOL = "room.transfer";
 export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
 
 export type NormalTransferCapabilityBlockedReason =
@@ -110,6 +112,13 @@ export function supportsNormalTransferCapability(
 	protocolVersion = 1,
 ): boolean {
 	return normalTransferCapabilityEligibility(manifest, protocolVersion).eligible;
+}
+
+export function supportsRoomTransfer(
+	manifest: CapabilityManifest | null | undefined,
+	protocolVersion = 1,
+): boolean {
+	return supportsCapability(manifest, ROOM_TRANSFER_PROTOCOL, protocolVersion);
 }
 
 export function supportsExplicitWorkloadCapability(

@@ -34,25 +34,29 @@ export interface CapabilityManifest {
 		available_connections: number;
 	};
 	observed_at: string | Date;
-	expires_at: string | Date;
 }
 
 export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
 
-function manifestTimeMs(value: string | Date): number {
-	return value instanceof Date ? value.getTime() : Date.parse(value);
+export type NormalTransferCapabilityBlockedReason =
+	| "manifest_missing_transfer_multipart"
+	| "manifest_zero_capacity"
+	| "manifest_protocol_unsupported";
+
+export interface NormalTransferCapabilityEligibility {
+	eligible: boolean;
+	manifestPresent: boolean;
+	defaultMultipartFallback: boolean;
+	blockedReason: NormalTransferCapabilityBlockedReason | null;
 }
 
 export function supportsCapability(
 	manifest: CapabilityManifest | null | undefined,
 	capability: string,
-	now = new Date(),
 	protocolVersion = 1,
 ): boolean {
 	capability = capability.trim();
 	if (!manifest || !capability) return false;
-	const expiresAtMs = manifestTimeMs(manifest.expires_at);
-	if (!Number.isFinite(expiresAtMs) || now.getTime() >= expiresAtMs) return false;
 	if (!Number.isFinite(manifest.capacity.available_connections) || manifest.capacity.available_connections <= 0) {
 		return false;
 	}
@@ -62,21 +66,58 @@ export function supportsCapability(
 	);
 }
 
+export function normalTransferCapabilityEligibility(
+	manifest: CapabilityManifest | null | undefined,
+	protocolVersion = 1,
+): NormalTransferCapabilityEligibility {
+	if (!manifest) {
+		return {
+			eligible: true,
+			manifestPresent: false,
+			defaultMultipartFallback: true,
+			blockedReason: null,
+		};
+	}
+	if (!Number.isFinite(manifest.capacity.available_connections) || manifest.capacity.available_connections <= 0) {
+		return {
+			eligible: false,
+			manifestPresent: true,
+			defaultMultipartFallback: false,
+			blockedReason: "manifest_zero_capacity",
+		};
+	}
+	if (!manifest.capabilities.includes(TRANSFER_MULTIPART_CAPABILITY)) {
+		return {
+			eligible: false,
+			manifestPresent: true,
+			defaultMultipartFallback: false,
+			blockedReason: "manifest_missing_transfer_multipart",
+		};
+	}
+	const supported = manifest.protocols.some((protocol) =>
+		protocol.name === TRANSFER_MULTIPART_CAPABILITY && protocol.min <= protocolVersion && protocol.max >= protocolVersion
+	);
+	return {
+		eligible: supported,
+		manifestPresent: true,
+		defaultMultipartFallback: false,
+		blockedReason: supported ? null : "manifest_protocol_unsupported",
+	};
+}
+
 export function supportsNormalTransferCapability(
 	manifest: CapabilityManifest | null | undefined,
-	now = new Date(),
 	protocolVersion = 1,
 ): boolean {
-	return !manifest || supportsCapability(manifest, TRANSFER_MULTIPART_CAPABILITY, now, protocolVersion);
+	return normalTransferCapabilityEligibility(manifest, protocolVersion).eligible;
 }
 
 export function supportsExplicitWorkloadCapability(
 	manifest: CapabilityManifest | null | undefined,
 	capability: string,
-	now = new Date(),
 	protocolVersion = 1,
 ): boolean {
-	return supportsCapability(manifest, capability, now, protocolVersion);
+	return supportsCapability(manifest, capability, protocolVersion);
 }
 
 export interface CandidateAllocation {

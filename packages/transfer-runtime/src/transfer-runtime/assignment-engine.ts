@@ -39,7 +39,7 @@ export interface CapabilityManifest {
 export const ROOM_TRANSFER_SCHEMA_VERSION = "room-transfer/v1";
 export const ROOM_TRANSFER_PROTOCOL = "room.transfer";
 export const ROOM_TRANSFER_DIRECT_CAPABILITY = "room.transfer.direct.v1";
-export const ROOM_TRANSFER_E2EE_CAPABILITY = "room.transfer.e2ee.v1";
+export const ROOM_TRANSFER_E2EE_CAPABILITY = "room.transfer.e2ee.v2";
 export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
 
 export type NormalTransferCapabilityBlockedReason =

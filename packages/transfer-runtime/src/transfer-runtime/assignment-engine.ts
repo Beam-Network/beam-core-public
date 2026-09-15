@@ -43,6 +43,32 @@ export const ROOM_TRANSFER_E2EE_CAPABILITY = "room.transfer.e2ee.v2";
 export const ROOM_STORAGE_SCHEMA_VERSION = "room-storage-transfer/v2";
 export const ROOM_STORAGE_CAPABILITY = "room.transfer.storage.v2";
 export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
+export const TRANSFER_MULTIPART_FANOUT_CAPABILITY = "transfer.multipart.fanout.v1";
+
+export function supportsSourceFanout(manifest: CapabilityManifest | null | undefined): boolean {
+	return supportsCapability(manifest, TRANSFER_MULTIPART_CAPABILITY)
+		&& supportsCapability(manifest, TRANSFER_MULTIPART_FANOUT_CAPABILITY);
+}
+
+/**
+ * Standard signed multipart fanout allocates source groups, while settlement
+ * retains individual destination task/attempt identities. Each group is bound
+ * to one worker. Its source buffer is reused across bounded destination batches;
+ * neither provider admission nor transport framing splits it into new readers.
+ * Recovery passes only missing delivery indices to this grouping operation.
+ */
+export function groupSourceDeliveries(deliveryIndices: readonly number[], destinationCount: number): Map<number, number[]> {
+	if (!Number.isSafeInteger(destinationCount) || destinationCount < 1) throw new Error("invalid destination count");
+	const groups = new Map<number,number[]>();
+	for (const index of [...new Set(deliveryIndices)].sort((a,b) => a-b)) {
+		if (!Number.isSafeInteger(index) || index < 0) throw new Error("invalid delivery index");
+		const sourceIndex = Math.floor(index / destinationCount);
+		const deliveries = groups.get(sourceIndex) ?? [];
+		deliveries.push(index);
+		groups.set(sourceIndex,deliveries);
+	}
+	return groups;
+}
 
 export type NormalTransferCapabilityBlockedReason =
 	| "manifest_missing_transfer_multipart"

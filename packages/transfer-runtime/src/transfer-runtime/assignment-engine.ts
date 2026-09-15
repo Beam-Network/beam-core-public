@@ -40,7 +40,35 @@ export const ROOM_TRANSFER_SCHEMA_VERSION = "room-transfer/v1";
 export const ROOM_TRANSFER_PROTOCOL = "room.transfer";
 export const ROOM_TRANSFER_DIRECT_CAPABILITY = "room.transfer.direct.v1";
 export const ROOM_TRANSFER_E2EE_CAPABILITY = "room.transfer.e2ee.v2";
+export const ROOM_STORAGE_SCHEMA_VERSION = "room-storage-transfer/v2";
+export const ROOM_STORAGE_CAPABILITY = "room.transfer.storage.v2";
 export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
+export const TRANSFER_MULTIPART_FANOUT_CAPABILITY = "transfer.multipart.fanout.v1";
+
+export function supportsSourceFanout(manifest: CapabilityManifest | null | undefined): boolean {
+	return supportsCapability(manifest, TRANSFER_MULTIPART_CAPABILITY)
+		&& supportsCapability(manifest, TRANSFER_MULTIPART_FANOUT_CAPABILITY);
+}
+
+/**
+ * Standard signed multipart fanout allocates source groups, while settlement
+ * retains individual destination task/attempt identities. Each group is bound
+ * to one worker. Its source buffer is reused across bounded destination batches;
+ * neither provider admission nor transport framing splits it into new readers.
+ * Recovery passes only missing delivery indices to this grouping operation.
+ */
+export function groupSourceDeliveries(deliveryIndices: readonly number[], destinationCount: number): Map<number, number[]> {
+	if (!Number.isSafeInteger(destinationCount) || destinationCount < 1) throw new Error("invalid destination count");
+	const groups = new Map<number,number[]>();
+	for (const index of [...new Set(deliveryIndices)].sort((a,b) => a-b)) {
+		if (!Number.isSafeInteger(index) || index < 0) throw new Error("invalid delivery index");
+		const sourceIndex = Math.floor(index / destinationCount);
+		const deliveries = groups.get(sourceIndex) ?? [];
+		deliveries.push(index);
+		groups.set(sourceIndex,deliveries);
+	}
+	return groups;
+}
 
 export type NormalTransferCapabilityBlockedReason =
 	| "manifest_missing_transfer_multipart"
@@ -123,6 +151,63 @@ export function supportsRoomTransfer(
 	return supportsCapability(manifest, ROOM_TRANSFER_PROTOCOL, protocolVersion)
 		&& supportsCapability(manifest, ROOM_TRANSFER_DIRECT_CAPABILITY, protocolVersion)
 		&& supportsCapability(manifest, ROOM_TRANSFER_E2EE_CAPABILITY, protocolVersion);
+}
+
+/** Hybrid work requires explicit support; an MLS-only participant is ineligible.
+ * Agent-only publications keep their existing MLS capability requirement.
+ * Storage-involving publications use TLS with worker-visible plaintext for all
+ * destinations. Agent access is bound to the worker, range, operation, attempt,
+ * expiry and TLS certificate by the coordinator-authorized assignment.
+ */
+export function supportsRoomStorage(
+	manifest: CapabilityManifest | null | undefined,
+	protocolVersion = 1,
+): boolean {
+	return supportsCapability(manifest, ROOM_TRANSFER_PROTOCOL, protocolVersion)
+		&& supportsCapability(manifest, ROOM_STORAGE_CAPABILITY, protocolVersion);
+}
+
+export interface RoomSourceCoverageRange {
+	chunkStart: number;
+	chunkEnd: number;
+	memberIds: string[];
+}
+
+/** Plan source coverage separately from destination delivery coverage.
+ * Initially every cell is missing, so every range contains the full frozen
+ * recipient snapshot. Recovery includes only unverified cells. Adjacent chunks
+ * merge only when their missing recipient sets agree, and each source chunk
+ * appears in at most one returned range. Further participant/worker slicing
+ * must preserve those ranges' recipient sets and disjoint source coverage.
+ * Workers read each assigned chunk once and reuse it across its destinations;
+ * a destination retry must reuse the buffer while the assignment remains live.
+ * Verified cells survive recovery, and stale attempts cannot add new evidence.
+ */
+export function planRoomMissingCoverage(input: {
+	chunkStart: number;
+	chunkEnd: number;
+	memberIds: readonly string[];
+	isVerified: (memberId: string, chunkIndex: number) => boolean;
+}): RoomSourceCoverageRange[] {
+	const snapshot = [...new Set(input.memberIds)].sort();
+	const ranges: RoomSourceCoverageRange[] = [];
+	let preceding: RoomSourceCoverageRange | undefined;
+	for (let chunkIndex = input.chunkStart; chunkIndex <= input.chunkEnd; chunkIndex++) {
+		const memberIds = snapshot.filter((memberId) => !input.isVerified(memberId, chunkIndex));
+		if (memberIds.length === 0) {
+			preceding = undefined;
+			continue;
+		}
+		const sameRecipients = preceding?.memberIds.length === memberIds.length
+			&& memberIds.every((memberId, index) => preceding!.memberIds[index] === memberId);
+		if (preceding && preceding.chunkEnd + 1 === chunkIndex && sameRecipients) {
+			preceding.chunkEnd = chunkIndex;
+		} else {
+			preceding = { chunkStart: chunkIndex, chunkEnd: chunkIndex, memberIds };
+			ranges.push(preceding);
+		}
+	}
+	return ranges;
 }
 
 export function supportsExplicitWorkloadCapability(

@@ -50,8 +50,19 @@ export function supportsSourceFanout(manifest: CapabilityManifest | null | undef
 		&& supportsCapability(manifest, TRANSFER_MULTIPART_FANOUT_CAPABILITY);
 }
 
+/** Destination count alone must never restrict ordinary multipart eligibility. */
+export function sourceFanoutDestinationCount(context: {
+	roomBound: boolean;
+	signedMultipart: boolean;
+	destinationCount: number;
+}): number {
+	if (!context.roomBound || !context.signedMultipart) return 0;
+	return Number.isSafeInteger(context.destinationCount) && context.destinationCount > 0
+		? context.destinationCount : 0;
+}
+
 /**
- * Standard signed multipart fanout allocates source groups, while settlement
+ * Room-bound signed multipart fanout allocates source groups, while settlement
  * retains individual destination task/attempt identities. Each group is bound
  * to one worker. Its source buffer is reused across bounded destination batches;
  * neither provider admission nor transport framing splits it into new readers.

@@ -43,6 +43,7 @@ export const ROOM_TRANSFER_E2EE_CAPABILITY = "room.transfer.e2ee.v2";
 export const ROOM_STORAGE_SCHEMA_VERSION = "room-storage-transfer/v2";
 export const ROOM_STORAGE_CAPABILITY = "room.transfer.storage.v2";
 export const TRANSFER_MULTIPART_CAPABILITY = "transfer.multipart";
+export const TRANSFER_MULTIPART_PROTOCOL_VERSION = 2;
 export const TRANSFER_MULTIPART_FANOUT_CAPABILITY = "transfer.multipart.fanout.v1";
 
 export function supportsSourceFanout(manifest: CapabilityManifest | null | undefined): boolean {
@@ -82,6 +83,7 @@ export function groupSourceDeliveries(deliveryIndices: readonly number[], destin
 }
 
 export type NormalTransferCapabilityBlockedReason =
+	| "manifest_missing"
 	| "manifest_missing_transfer_multipart"
 	| "manifest_zero_capacity"
 	| "manifest_protocol_unsupported";
@@ -89,7 +91,6 @@ export type NormalTransferCapabilityBlockedReason =
 export interface NormalTransferCapabilityEligibility {
 	eligible: boolean;
 	manifestPresent: boolean;
-	defaultMultipartFallback: boolean;
 	blockedReason: NormalTransferCapabilityBlockedReason | null;
 }
 
@@ -111,21 +112,18 @@ export function supportsCapability(
 
 export function normalTransferCapabilityEligibility(
 	manifest: CapabilityManifest | null | undefined,
-	protocolVersion = 1,
 ): NormalTransferCapabilityEligibility {
 	if (!manifest) {
 		return {
-			eligible: true,
+			eligible: false,
 			manifestPresent: false,
-			defaultMultipartFallback: true,
-			blockedReason: null,
+			blockedReason: "manifest_missing",
 		};
 	}
 	if (!Number.isFinite(manifest.capacity.available_connections) || manifest.capacity.available_connections <= 0) {
 		return {
 			eligible: false,
 			manifestPresent: true,
-			defaultMultipartFallback: false,
 			blockedReason: "manifest_zero_capacity",
 		};
 	}
@@ -133,26 +131,23 @@ export function normalTransferCapabilityEligibility(
 		return {
 			eligible: false,
 			manifestPresent: true,
-			defaultMultipartFallback: false,
 			blockedReason: "manifest_missing_transfer_multipart",
 		};
 	}
 	const supported = manifest.protocols.some((protocol) =>
-		protocol.name === TRANSFER_MULTIPART_CAPABILITY && protocol.min <= protocolVersion && protocol.max >= protocolVersion
+		protocol.name === TRANSFER_MULTIPART_CAPABILITY && protocol.min <= TRANSFER_MULTIPART_PROTOCOL_VERSION && protocol.max >= TRANSFER_MULTIPART_PROTOCOL_VERSION
 	);
 	return {
 		eligible: supported,
 		manifestPresent: true,
-		defaultMultipartFallback: false,
 		blockedReason: supported ? null : "manifest_protocol_unsupported",
 	};
 }
 
 export function supportsNormalTransferCapability(
 	manifest: CapabilityManifest | null | undefined,
-	protocolVersion = 1,
 ): boolean {
-	return normalTransferCapabilityEligibility(manifest, protocolVersion).eligible;
+	return normalTransferCapabilityEligibility(manifest).eligible;
 }
 
 export function supportsRoomTransfer(

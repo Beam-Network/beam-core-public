@@ -41,6 +41,8 @@ export interface QualifiedOrchestratorWeightInput {
 	performanceScore: number;
 	readinessActiveTimeMultiplier: number;
 	penaltyMultiplier: number;
+  fraudReportReward: number;
+  fraudReportRewardIds: readonly string[];
 	taskDoneCount: number;
 	verifiedUploadedMib: number;
 }
@@ -78,7 +80,8 @@ export interface EpochSummaryRepository {
 
 export interface EpochSummaryStore {
 	backfillEmptyTotals(epochs: readonly number[], chain: ChainEpochSnapshot): Promise<void>;
-	upsertRows(rows: readonly EpochSummaryRow[]): Promise<void>;
+	// Replace only this epoch's cohort, including when it is empty. Older snapshots remain intact.
+	replaceCurrentEpochRows(epoch: number, rows: readonly EpochSummaryRow[]): Promise<void>;
 	upsertTotals(totals: EpochSummaryTotals): Promise<void>;
 	refreshStoredTaskCounts(epoch: number, counts: ReadonlyMap<string, number>): Promise<void>;
 	pruneBeforeEpoch(firstRetainedEpoch: number): Promise<void>;
@@ -142,7 +145,7 @@ export function buildEpochSummary(input: {
 	epochTaskCounts: ReadonlyMap<string, number>;
 }): { rows: EpochSummaryRow[]; totals: EpochSummaryTotals } {
 	const rawScores = input.orchestrators.map((orchestrator) =>
-		computeRawScore(orchestrator.verifiedUploadedMib, orchestrator.penaltyMultiplier),
+    computeRawScore(orchestrator.verifiedUploadedMib, orchestrator.penaltyMultiplier, orchestrator.fraudReportReward),
 	);
 	const prismFinalScores = input.orchestrators.map((orchestrator) =>
 		Math.max(
@@ -221,7 +224,7 @@ export async function materializeCurrentEpoch(
 
 	await repository.transaction(async (store) => {
 		if (backfilledEpochs.length) await store.backfillEmptyTotals(backfilledEpochs, chain);
-		await store.upsertRows(summary.rows);
+		await store.replaceCurrentEpochRows(chain.currentEpoch, summary.rows);
 		await store.upsertTotals(summary.totals);
 		if (refreshPrevious) {
 			await store.refreshStoredTaskCounts(chain.currentEpoch - 1, previousCounts);

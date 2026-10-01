@@ -1,11 +1,16 @@
 /**
  * Pure helpers for epoch summary weights (testable, no DB).
- * raw_i = verified_uploaded_mib_i * penalty_multiplier_i, where verified_uploaded_mib_i is
+ * raw_i = verified_uploaded_mib_i * penalty_multiplier_i * fraud_report_reward_i, where verified_uploaded_mib_i is
  * the completed production upload MiB total in the PRISM evidence window; tiered
  * weights sum to 1 when raw work exists.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_v3";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_x_fraud_report_reward_v4";
+export const FRAUD_REPORT_BONUS_PERCENTAGES = { critical: 30, high: 20, medium: 10, low: 5 } as const;
+
+export function fraudReportReward(bonusPercentages: readonly number[]): number {
+  return 1 + Math.min(100, bonusPercentages.reduce((sum, bonus) => sum + (Number.isFinite(bonus) ? Math.max(0, bonus) : 0), 0)) / 100;
+}
 
 export type EmissionTier = "A" | "B" | "C" | "D" | "E";
 
@@ -34,10 +39,11 @@ export interface TieredWeightResult {
 	effectiveTierShares: Record<EmissionTier, number>;
 }
 
-export function computeRawScore(verifiedUploadedMib: number, penaltyMultiplier: number): number {
+export function computeRawScore(verifiedUploadedMib: number, penaltyMultiplier: number, fraudReportRewardMultiplier: number): number {
 	const m = Number.isFinite(verifiedUploadedMib) ? verifiedUploadedMib : 0;
 	const p = Number.isFinite(penaltyMultiplier) ? penaltyMultiplier : 0;
-	return Math.max(0, m) * Math.max(0, p);
+  const reward = Number.isFinite(fraudReportRewardMultiplier) ? Math.max(1, Math.min(2, fraudReportRewardMultiplier)) : 1;
+  return Math.max(0, m) * Math.max(0, p) * reward;
 }
 
 function safeScore(value: number): number {
@@ -140,4 +146,49 @@ export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[
 
 export function sumWeights(weights: number[]): number {
 	return weights.reduce((s, w) => s + w, 0);
+}
+
+export interface RewardSnapshotInput extends TieredWeightInput {
+  penaltyMultiplier: number;
+  rewardIds: readonly string[];
+  normalizedWeight: number;
+}
+
+export interface AwardContribution {
+  id: string;
+  hotkey: string;
+  netuid: number;
+  bonusPercentage: number;
+  appliedAt: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
+}
+
+/** Trusted services supply award records and evaluation time, independent of participant claims. */
+export function recalculateSnapshotAfterRewardExpiry(
+  snapshot: readonly RewardSnapshotInput[], awards: readonly AwardContribution[], netuid: number, evaluatedAt: Date,
+) {
+  const active = new Map(awards.filter((award) => award.netuid === netuid
+    && award.appliedAt <= evaluatedAt && award.expiresAt > evaluatedAt
+    && (award.revokedAt === null || award.revokedAt > evaluatedAt)).map((award) => [award.id, award]));
+  let adjusted = false;
+  const rows = snapshot.map((row) => {
+    // Only captured IDs can contribute: newer grants never attach to historical work.
+    const included = row.rewardIds.flatMap((id) => {
+      const award = active.get(id);
+      return award?.hotkey === row.hotkey ? [award] : [];
+    });
+    if (included.length !== row.rewardIds.length) adjusted = true;
+    const reward = fraudReportReward(included.map((award) => award.bonusPercentage));
+    return { ...row, rewardIds: included.map((award) => award.id), fraudReportReward: reward,
+      rawScore: computeRawScore(row.verifiedUploadedMib, row.penaltyMultiplier, reward) };
+  });
+  const weights = adjusted ? normalizeWeightsWithEmissionTiers(rows).weights : snapshot.map((row) => row.normalizedWeight);
+  return {
+    source: adjusted ? "epoch_summary_reward_expiry_adjusted" : "epoch_summary",
+    rewardEvaluatedAt: evaluatedAt,
+    weights,
+    uint16Weights: weights.map((weight) => Math.max(0, Math.min(65535, Math.floor(weight * 65535)))),
+    rows: rows.map((row, index) => ({ ...row, normalizedWeight: weights[index]! })),
+  };
 }

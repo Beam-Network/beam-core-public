@@ -36,10 +36,7 @@ export interface QualifiedOrchestratorWeightInput {
 	hotkey: string;
 	uid: number | null;
 	stakeTao: number;
-	throughputScore: number;
-	reliabilityScore: number;
-	performanceScore: number;
-	readinessActiveTimeMultiplier: number;
+    profiles: readonly {workload:'standard_transfers'|'room_transfers';pool:'qualified';prismFinalScore:number;epochVerifiedBytes:number}[];
 	penaltyMultiplier: number;
   fraudReportReward: number;
   fraudReportRewardIds: readonly string[];
@@ -49,7 +46,7 @@ export interface QualifiedOrchestratorWeightInput {
 
 export interface EpochSummaryRow extends QualifiedOrchestratorWeightInput {
 	epoch: number;
-	prismFinalScore: number;
+	emissionPrismTiebreakScore: number;
 	epochTaskDoneCount: number;
 	rawWeight: number;
 	normalizedWeight: number;
@@ -147,14 +144,10 @@ export function buildEpochSummary(input: {
 	const rawScores = input.orchestrators.map((orchestrator) =>
     computeRawScore(orchestrator.verifiedUploadedMib, orchestrator.penaltyMultiplier, orchestrator.fraudReportReward),
 	);
-	const prismFinalScores = input.orchestrators.map((orchestrator) =>
-		Math.max(
-			0,
-			orchestrator.performanceScore
-				* orchestrator.readinessActiveTimeMultiplier
-				* orchestrator.penaltyMultiplier,
-		),
-	);
+    const prismFinalScores=input.orchestrators.map(o=>{
+      const bytes=o.profiles.reduce((sum,p)=>sum+p.epochVerifiedBytes,0);
+      return bytes>0?o.profiles.reduce((sum,p)=>sum+p.epochVerifiedBytes*p.prismFinalScore,0)/bytes:0;
+    });
 	const normalized = normalizeWeightsWithEmissionTiers(
 		input.orchestrators.map((orchestrator, index) => ({
 			uid: orchestrator.uid,
@@ -167,7 +160,7 @@ export function buildEpochSummary(input: {
 	const rows = input.orchestrators.map((orchestrator, index): EpochSummaryRow => ({
 		...orchestrator,
 		epoch: input.epoch,
-		prismFinalScore: prismFinalScores[index] ?? 0,
+		emissionPrismTiebreakScore: prismFinalScores[index] ?? 0,
 		epochTaskDoneCount: input.epochTaskCounts.get(orchestrator.id) ?? 0,
 		rawWeight: rawScores[index] ?? 0,
 		normalizedWeight: normalized.weights[index] ?? 0,

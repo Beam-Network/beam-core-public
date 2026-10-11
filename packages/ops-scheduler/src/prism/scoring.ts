@@ -30,10 +30,10 @@ export function duelResult(upper:AssignmentResult,lower:AssignmentResult):DuelRe
   return upper.durationMs===lower.durationMs?'draw':upper.durationMs<lower.durationMs?'upper_win':'lower_win';
 }
 export function stakes(n:number,fleet:number):{defence:string;upset:string} {
-  if(n<2)return {defence:'0.000000',upset:'0.000000'};
+  if(n<2)return {defence:'0',upset:'0'};
   if(!Number.isInteger(n)||!Number.isInteger(fleet)||fleet<n)throw new Error('Invalid fleet');
-  const r=fleet===2?1:Math.max(0,Math.min(1,(n-2)/(fleet-2)));
-  return {defence:(1+4*r).toFixed(6),upset:(5+10*r).toFixed(6)};
+  const share=(points:number)=>fleet===2?points:Math.round(points*(n-2)/(fleet-2));
+  return {defence:String(1+share(4)),upset:String(5+share(10))};
 }
 export function normalizePoints(points:string,lowest:string,highest:string):number {
   const p=units(points),lo=units(lowest),hi=units(highest);

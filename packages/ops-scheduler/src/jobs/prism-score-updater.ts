@@ -8,8 +8,8 @@ export function settleWave(wave:FrozenWave,outcomes:ReadonlyMap<string,Assignmen
     const upper=wave.participants[i]!,lower=wave.participants[i+1]!,a=outcomes.get(upper.id),b=outcomes.get(lower.id);
     const result=a&&b?duelResult(a,b):'unrated';
     duels.push({index:i,upper:upper.id,lower:lower.id,result,
-      upperDelta:result==='upper_win'?stake.defence:result==='lower_win'?'-'+stake.upset:'0.000000',
-      lowerDelta:result==='lower_win'?stake.upset:result==='upper_win'?'-'+stake.defence:'0.000000'});
+      upperDelta:result==='upper_win'?stake.defence:result==='lower_win'?'-'+stake.upset:'0',
+      lowerDelta:result==='lower_win'?stake.upset:result==='upper_win'?'-'+stake.defence:'0'});
   }return duels;
 }
 export function workloadFinalScore(points:string,min:string,max:string,readiness:number,penalty:number):number {

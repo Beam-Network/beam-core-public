@@ -29,15 +29,22 @@ export function duelResult(upper:AssignmentResult,lower:AssignmentResult):DuelRe
   if(upper.durationMs===null||lower.durationMs===null||!Number.isFinite(upper.durationMs)||!Number.isFinite(lower.durationMs))return 'unrated';
   return upper.durationMs===lower.durationMs?'draw':upper.durationMs<lower.durationMs?'upper_win':'lower_win';
 }
-export function stakes(n:number,fleet:number):{defence:string;upset:string} {
-  if(n<2)return {defence:'0',upset:'0'};
+export function stake(n:number,fleet:number):string {
+  if(n<2)return '0';
   if(!Number.isInteger(n)||!Number.isInteger(fleet)||fleet<n)throw new Error('Invalid fleet');
-  const share=(points:number)=>fleet===2?points:Math.round(points*(n-2)/(fleet-2));
-  return {defence:String(1+share(4)),upset:String(5+share(10))};
+  return String(5+(fleet===2?10:Math.round(10*(n-2)/(fleet-2))));
+}
+export const RECOVERY_FAILURE_STAKES=3;
+export function recoveryCharge(firstWaveStake:string,failedRecoveries:number):string {
+  return String(-RECOVERY_FAILURE_STAKES*Number(firstWaveStake)*failedRecoveries);
+}
+export function transferWideFailure(outcomes:readonly AssignmentResult[]):boolean {
+  const rated=outcomes.filter(o=>o.accountableTasks>0);
+  return rated.length>=2&&rated.filter(o=>o.successfulTasks<o.accountableTasks).length*2>rated.length;
 }
 export function normalizePoints(points:string,lowest:string,highest:string):number {
   const p=units(points),lo=units(lowest),hi=units(highest);
-  return lo===hi?0.5:Math.max(0.2,Math.min(1,0.2+0.8*Number(p-lo)/Number(hi-lo)));
+  return lo===hi?0.5:Math.max(0,Math.min(1,Number(p-lo)/Number(hi-lo)));
 }
 export function verifiedGoodput(bytes:number,durationMs:number|null):number|null {
   return durationMs!==null&&Number.isFinite(durationMs)&&durationMs>0&&Number.isFinite(bytes)&&bytes>=0?bytes*8/durationMs/1000:null;

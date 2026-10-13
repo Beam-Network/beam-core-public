@@ -9,6 +9,8 @@ export function workloadConfidence(workload:keyof typeof QUALIFICATION_TASK_TARG
 }
 export interface AssignmentResult {successfulTasks:number;accountableTasks:number;durationMs:number|null}
 export type DuelResult='upper_win'|'lower_win'|'draw'|'unrated';
+export const SPEED_DRAW_PERCENT=5;
+export const ZERO_SIGNIFICANCE=3;
 export interface WaveParticipant {id:string;assignedTasks:number;finalScore:number;points:string}
 function units(value:string):bigint {
   if(!/^-?\d+(\.\d{1,6})?$/.test(value)) throw new Error('Invalid points');
@@ -27,7 +29,9 @@ export function duelResult(upper:AssignmentResult,lower:AssignmentResult):DuelRe
   if(a!==b)return a>b?'upper_win':'lower_win';
   if(!upper.successfulTasks&&!lower.successfulTasks)return 'draw';
   if(upper.durationMs===null||lower.durationMs===null||!Number.isFinite(upper.durationMs)||!Number.isFinite(lower.durationMs))return 'unrated';
-  return upper.durationMs===lower.durationMs?'draw':upper.durationMs<lower.durationMs?'upper_win':'lower_win';
+  const faster=Math.min(upper.durationMs,lower.durationMs),slower=Math.max(upper.durationMs,lower.durationMs);
+  if(slower*100<=faster*(100+SPEED_DRAW_PERCENT))return 'draw';
+  return upper.durationMs<lower.durationMs?'upper_win':'lower_win';
 }
 export function stake(n:number,fleet:number):string {
   if(n<2)return '0';
@@ -42,9 +46,16 @@ export function transferWideFailure(outcomes:readonly AssignmentResult[]):boolea
   const rated=outcomes.filter(o=>o.accountableTasks>0);
   return rated.length>=2&&rated.filter(o=>o.successfulTasks<o.accountableTasks).length*2>rated.length;
 }
-export function normalizePoints(points:string,lowest:string,highest:string):number {
+export function scaleBottom(lowest:string,lowestVariance:string):bigint {
+  if(!/^\d+$/.test(lowestVariance))throw new Error('Invalid variance');
+  const lo=units(lowest),threshold=-BigInt(Math.ceil(ZERO_SIGNIFICANCE*Math.sqrt(Number(lowestVariance))*1000000));
+  return lo<0n&&lo<=threshold?lo:threshold<lo?threshold:lo-1000000n;
+}
+export function normalizePoints(points:string,lowest:string,highest:string,lowestVariance:string):number {
   const p=units(points),lo=units(lowest),hi=units(highest);
-  return lo===hi?0.5:Math.max(0,Math.min(1,Number(p-lo)/Number(hi-lo)));
+  if(lo===hi)return 0.5;
+  const bottom=scaleBottom(lowest,lowestVariance);
+  return Math.max(0,Math.min(1,Number(p-bottom)/Number(hi-bottom)));
 }
 export function verifiedGoodput(bytes:number,durationMs:number|null):number|null {
   return durationMs!==null&&Number.isFinite(durationMs)&&durationMs>0&&Number.isFinite(bytes)&&bytes>=0?bytes*8/durationMs/1000:null;

@@ -13,8 +13,8 @@ export function settleWave(wave:FrozenWave,outcomes:ReadonlyMap<string,Assignmen
       lowerDelta:result==='lower_win'?s:result==='upper_win'?'-'+s:'0'});
   }return duels;
 }
-export function workloadFinalScore(points:string,min:string,max:string,readiness:number,penalty:number):number {
-  return normalizePoints(points,min,max)*readiness*penalty;
+export function workloadFinalScore(points:string,min:string,max:string,minVariance:string,readiness:number,penalty:number):number {
+  return normalizePoints(points,min,max,minVariance)*readiness*penalty;
 }
 export function countsInPerformanceWindow(settledAt:Date,now:Date):boolean {
   return settledAt.getTime()>now.getTime()-86400000&&settledAt.getTime()<=now.getTime();

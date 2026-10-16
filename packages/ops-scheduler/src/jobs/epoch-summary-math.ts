@@ -1,11 +1,12 @@
 /**
  * Pure helpers for epoch summary weights (testable, no DB).
- * raw_i = verified_uploaded_mib_i * penalty_multiplier_i * fraud_report_reward_i, where verified_uploaded_mib_i is
- * the completed production upload MiB total in the PRISM evidence window; tiered
- * weights sum to 1 when raw work exists.
+ * Upload-only tiers are followed by a normalized report-reward base, sell
+ * reduction and holding redistribution, then penalties and final normalization.
+ * Trusted callers supply the captured selling state; allowance credits use the
+ * rewarded base share, excluding received redistribution.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_penalty_x_fraud_report_reward_v4";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_fraud_report_reward_x_sell_allowance_x_penalty_v7";
 export const FRAUD_REPORT_BONUS_PERCENTAGES = { critical: 30, high: 20, medium: 10, low: 5 } as const;
 
 export function fraudReportReward(bonusPercentages: readonly number[]): number {
@@ -39,11 +40,8 @@ export interface TieredWeightResult {
 	effectiveTierShares: Record<EmissionTier, number>;
 }
 
-export function computeRawScore(verifiedUploadedMib: number, penaltyMultiplier: number, fraudReportRewardMultiplier: number): number {
-	const m = Number.isFinite(verifiedUploadedMib) ? verifiedUploadedMib : 0;
-	const p = Number.isFinite(penaltyMultiplier) ? penaltyMultiplier : 0;
-  const reward = Number.isFinite(fraudReportRewardMultiplier) ? Math.max(1, Math.min(2, fraudReportRewardMultiplier)) : 1;
-  return Math.max(0, m) * Math.max(0, p) * reward;
+export function computeRawScore(verifiedUploadedMib: number): number {
+  return Number.isFinite(verifiedUploadedMib) ? Math.max(0, verifiedUploadedMib) : 0;
 }
 
 function safeScore(value: number): number {
@@ -148,8 +146,64 @@ export function sumWeights(weights: number[]): number {
 	return weights.reduce((s, w) => s + w, 0);
 }
 
+export interface SellWeightState {
+  multiplier: number;
+  holding: number;
+  owner: string;
+}
+
+export interface EmissionAdjustmentInput {
+  tierWeight: number;
+  reportReward: number;
+  penalty: number;
+  sellState: SellWeightState;
+}
+
+function normalized(values: number[]): number[] {
+  const total = sumWeights(values);
+  if (total <= 0) return values.map(() => 0);
+  const shares = values.map(value => value / total);
+  const last = values.map((value, index) => value > 0 ? index : -1).filter(index => index >= 0).pop()!;
+  shares[last] = Math.max(0, shares[last]! + 1 - sumWeights(shares));
+  return shares;
+}
+
+/** Rewards affect own base once. Holding, not the report bonus, divides received cuts. */
+export function adjustEmissionWeights(inputs: readonly EmissionAdjustmentInput[]) {
+  const baseWeights = normalized(inputs.map(row => safeScore(row.tierWeight)
+    * (Number.isFinite(row.reportReward) ? Math.max(1, Math.min(2, row.reportReward)) : 1)));
+  const factor = (value: number) => Math.round(Math.max(0, Math.min(1, safeScore(value))) * 1e10) / 1e10;
+  const kept = baseWeights.map((base, i) => base * factor(inputs[i]!.sellState.multiplier));
+  const received = inputs.map(() => 0);
+  const owners = [...new Set(inputs.map(row => row.sellState.owner))].sort();
+  for (const owner of owners) {
+    const cut = inputs.reduce((amount, row, i) => row.sellState.owner === owner
+      ? amount + baseWeights[i]! - kept[i]! : amount, 0);
+    if (cut <= 0) continue;
+    const holding = inputs.map((row, i) => row.sellState.owner !== owner && baseWeights[i]! > 0
+      && factor(row.sellState.multiplier) === 1 ? factor(row.sellState.holding) : 0);
+    const scores = sumWeights(holding) > 0 ? holding : kept;
+    const scoreTotal = sumWeights(scores);
+    if (scoreTotal > 0) scores.forEach((score, i) => { received[i] = received[i]! + cut * score / scoreTotal; });
+  }
+  const weights = normalized(inputs.map((row, i) => (kept[i]! + received[i]!) * safeScore(row.penalty)));
+  return { baseWeights, received, weights };
+}
+
+export function toUint16Weights(weights: readonly number[]): number[] {
+  const shares = normalized(weights.map(safeScore));
+  const quotas = shares.map(share => share * 65535);
+  const units = quotas.map(Math.floor);
+  let left = sumWeights(shares) > 0 ? 65535 - sumWeights(units) : 0;
+  const order = quotas.map((value, index) => ({ index, fraction: value - units[index]! }))
+    .sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+  for (const row of order) { if (left <= 0) break; units[row.index] = units[row.index]! + 1; left--; }
+  return units;
+}
+
 export interface RewardSnapshotInput extends TieredWeightInput {
   penaltyMultiplier: number;
+  sellState: SellWeightState;
   rewardIds: readonly string[];
   normalizedWeight: number;
 }
@@ -181,14 +235,18 @@ export function recalculateSnapshotAfterRewardExpiry(
     if (included.length !== row.rewardIds.length) adjusted = true;
     const reward = fraudReportReward(included.map((award) => award.bonusPercentage));
     return { ...row, rewardIds: included.map((award) => award.id), fraudReportReward: reward,
-      rawScore: computeRawScore(row.verifiedUploadedMib, row.penaltyMultiplier, reward) };
+      rawScore: computeRawScore(row.verifiedUploadedMib) };
   });
-  const weights = adjusted ? normalizeWeightsWithEmissionTiers(rows).weights : snapshot.map((row) => row.normalizedWeight);
+  const tiers = normalizeWeightsWithEmissionTiers(rows);
+  const weights = adjusted ? adjustEmissionWeights(rows.map((row, i) => ({
+    tierWeight: tiers.weights[i]!, reportReward: row.fraudReportReward,
+    penalty: row.penaltyMultiplier, sellState: row.sellState,
+  }))).weights : snapshot.map(row => row.normalizedWeight);
   return {
     source: adjusted ? "epoch_summary_reward_expiry_adjusted" : "epoch_summary",
     rewardEvaluatedAt: evaluatedAt,
     weights,
-    uint16Weights: weights.map((weight) => Math.max(0, Math.min(65535, Math.floor(weight * 65535)))),
+    uint16Weights: toUint16Weights(weights),
     rows: rows.map((row, index) => ({ ...row, normalizedWeight: weights[index]! })),
   };
 }

@@ -2,12 +2,14 @@
 
 import {
 	computeRawScore,
+	adjustEmissionWeights,
+	toUint16Weights,
+	type SellWeightState,
 	normalizeWeightsWithEmissionTiers,
 	PRISM_WEIGHT_FORMULA_VERSION,
 	type EmissionTier,
 } from "./epoch-summary-math.js";
 
-const MAX_UINT16 = 65_535;
 const BLOCK_MS = 12_000;
 const BLOCKS_PER_DAY = 7_200;
 const MAX_BACKFILL_EPOCHS = 50;
@@ -38,6 +40,7 @@ export interface QualifiedOrchestratorWeightInput {
 	stakeTao: number;
     profiles: readonly {workload:'standard_transfers'|'room_transfers';pool:'qualified';prismFinalScore:number;epochVerifiedBytes:number}[];
 	penaltyMultiplier: number;
+  sellState: SellWeightState;
   fraudReportReward: number;
   fraudReportRewardIds: readonly string[];
 	taskDoneCount: number;
@@ -92,9 +95,6 @@ export interface EpochMaterializationResult {
 	refreshedPreviousEpoch: boolean;
 }
 
-function toUint16Weight(normalizedWeight: number): number {
-	return Math.max(0, Math.min(MAX_UINT16, Math.floor(normalizedWeight * MAX_UINT16)));
-}
 
 export function epochRetentionCount(blocksPerEpoch: number): number {
 	return Math.ceil((30 * BLOCKS_PER_DAY) / Math.max(1, blocksPerEpoch));
@@ -142,7 +142,7 @@ export function buildEpochSummary(input: {
 	epochTaskCounts: ReadonlyMap<string, number>;
 }): { rows: EpochSummaryRow[]; totals: EpochSummaryTotals } {
 	const rawScores = input.orchestrators.map((orchestrator) =>
-    computeRawScore(orchestrator.verifiedUploadedMib, orchestrator.penaltyMultiplier, orchestrator.fraudReportReward),
+    computeRawScore(orchestrator.verifiedUploadedMib),
 	);
     const prismFinalScores=input.orchestrators.map(o=>{
       const bytes=o.profiles.reduce((sum,p)=>sum+p.epochVerifiedBytes,0);
@@ -157,14 +157,19 @@ export function buildEpochSummary(input: {
 			rawScore: rawScores[index] ?? 0,
 		})),
 	);
+  const adjusted = adjustEmissionWeights(input.orchestrators.map((orchestrator, i) => ({
+    tierWeight: normalized.weights[i]!, reportReward: orchestrator.fraudReportReward,
+    penalty: orchestrator.penaltyMultiplier, sellState: orchestrator.sellState,
+  })));
+  const uint16 = toUint16Weights(adjusted.weights);
 	const rows = input.orchestrators.map((orchestrator, index): EpochSummaryRow => ({
 		...orchestrator,
 		epoch: input.epoch,
 		emissionPrismTiebreakScore: prismFinalScores[index] ?? 0,
 		epochTaskDoneCount: input.epochTaskCounts.get(orchestrator.id) ?? 0,
 		rawWeight: rawScores[index] ?? 0,
-		normalizedWeight: normalized.weights[index] ?? 0,
-		uint16Weight: toUint16Weight(normalized.weights[index] ?? 0),
+		normalizedWeight: adjusted.weights[index] ?? 0,
+		uint16Weight: uint16[index] ?? 0,
 		tier: normalized.tiers[index] ?? "E",
 	}));
 	return {
@@ -176,7 +181,7 @@ export function buildEpochSummary(input: {
 			sumEpochTaskDoneCount: rows.reduce((sum, row) => sum + row.epochTaskDoneCount, 0),
 			sumVerifiedUploadedMib: rows.reduce((sum, row) => sum + row.verifiedUploadedMib, 0),
 			qualifiedOrchestratorCount: rows.length,
-			allWeightsZero: normalized.sumRaw === 0,
+			allWeightsZero: adjusted.weights.every(weight => weight === 0),
 			currentBlock: input.currentBlock,
 			blocksPerEpoch: input.blocksPerEpoch,
 			formulaVersion: PRISM_WEIGHT_FORMULA_VERSION,

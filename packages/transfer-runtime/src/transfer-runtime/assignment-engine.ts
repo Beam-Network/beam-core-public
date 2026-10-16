@@ -216,6 +216,46 @@ export function planRoomMissingCoverage(input: {
 	return ranges;
 }
 
+export function planRoomRecoveryChunks(input: Parameters<typeof planRoomMissingCoverage>[0] & {
+	isActive: (memberId: string, chunkIndex: number) => boolean;
+}): RoomSourceCoverageRange[] {
+	return planRoomMissingCoverage(input).flatMap((range) =>
+		Array.from({ length: range.chunkEnd - range.chunkStart + 1 }, (_, offset) => {
+			const chunkIndex = range.chunkStart + offset;
+			return { chunkStart: chunkIndex, chunkEnd: chunkIndex,
+				memberIds: range.memberIds.filter((memberId) => !input.isActive(memberId, chunkIndex)) };
+		}).filter((chunk) => chunk.memberIds.length > 0));
+}
+
+export function rankRoomCandidates(candidates: readonly OrchestratorCandidate[]): OrchestratorCandidate[] {
+	return candidates.filter((candidate) => Number.isFinite(candidate.prismFinalScore))
+		.sort((left, right) => right.prismFinalScore - left.prismFinalScore
+			|| left.hotkey.localeCompare(right.hotkey) || left.id.localeCompare(right.id));
+}
+
+export function buildRoomInitialAllocation(candidates: readonly OrchestratorCandidate[], totalChunks: number,
+	maxSourceConnections: number): CandidateAllocation[] {
+	const selected = rankRoomCandidates(candidates).slice(0, Math.max(1, maxSourceConnections));
+	const sizes = computePrismSlices(selected.map((candidate) => candidate.prismFinalScore), totalChunks);
+	return selected.flatMap((orchestrator, index) => sizes[index]! > 0 ? [{ orchestrator, chunkCount: sizes[index]! }] : []);
+}
+
+export function selectRoomRecoveryCandidate(input: {
+	candidates: readonly OrchestratorCandidate[];
+	failureCounts: ReadonlyMap<string, number>;
+	maxSourceConnections: number;
+	cycle: number;
+	usedOrchestratorIds: ReadonlySet<string>;
+}): { orchestrator: OrchestratorCandidate; cycle: number; reset: boolean } | null {
+	const ordered = rankRoomCandidates(input.candidates);
+	if (!ordered.length) return null;
+	const fewest = Math.min(...ordered.map((candidate) => input.failureCounts.get(candidate.id) ?? 0));
+	const cohort = ordered.filter((candidate) => (input.failureCounts.get(candidate.id) ?? 0) === fewest)
+		.slice(0, Math.max(1, input.maxSourceConnections));
+	const unused = cohort.find((candidate) => !input.usedOrchestratorIds.has(candidate.id));
+	return { orchestrator: unused ?? cohort[0]!, cycle: input.cycle + (unused ? 0 : 1), reset: !unused };
+}
+
 export function supportsExplicitWorkloadCapability(
 	manifest: CapabilityManifest | null | undefined,
 	capability: string,

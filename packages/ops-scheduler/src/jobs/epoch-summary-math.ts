@@ -6,7 +6,7 @@
  * rewarded base share, excluding received redistribution.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_fraud_report_reward_x_sell_allowance_x_penalty_v7";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_fraud_report_reward_x_accumulated_allowance_x_sell_allowance_x_penalty_v8";
 export const FRAUD_REPORT_BONUS_PERCENTAGES = { critical: 30, high: 20, medium: 10, low: 5 } as const;
 
 export function fraudReportReward(bonusPercentages: readonly number[]): number {

@@ -217,13 +217,13 @@ export function planRoomMissingCoverage(input: {
 }
 
 export function planRoomRecoveryChunks(input: Parameters<typeof planRoomMissingCoverage>[0] & {
-	isActive: (memberId: string, chunkIndex: number) => boolean;
+	isReserved: (memberId: string, chunkIndex: number) => boolean;
 }): RoomSourceCoverageRange[] {
 	return planRoomMissingCoverage(input).flatMap((range) =>
 		Array.from({ length: range.chunkEnd - range.chunkStart + 1 }, (_, offset) => {
 			const chunkIndex = range.chunkStart + offset;
 			return { chunkStart: chunkIndex, chunkEnd: chunkIndex,
-				memberIds: range.memberIds.filter((memberId) => !input.isActive(memberId, chunkIndex)) };
+				memberIds: range.memberIds.filter((memberId) => !input.isReserved(memberId, chunkIndex)) };
 		}).filter((chunk) => chunk.memberIds.length > 0));
 }
 
@@ -238,6 +238,29 @@ export function buildRoomInitialAllocation(candidates: readonly OrchestratorCand
 	const selected = rankRoomCandidates(candidates).slice(0, Math.max(1, maxSourceConnections));
 	const sizes = computePrismSlices(selected.map((candidate) => candidate.prismFinalScore), totalChunks);
 	return selected.flatMap((orchestrator, index) => sizes[index]! > 0 ? [{ orchestrator, chunkCount: sizes[index]! }] : []);
+}
+
+export interface RoomLaneReservation {
+	source: { id: string; maxConnections: number };
+	targets: readonly { id: string; maxConnections: number }[];
+	published: boolean;
+	terminal: boolean;
+}
+
+export function canPublishRoomLane(lane: RoomLaneReservation, reservations: readonly RoomLaneReservation[]): boolean {
+	if (lane.published || lane.terminal) return false;
+	const active = reservations.filter((reservation) => reservation.published && !reservation.terminal);
+	const sources = active.filter((reservation) => reservation.source.id === lane.source.id);
+	if (sources.length >= Math.min(lane.source.maxConnections, ...sources.map((reservation) => reservation.source.maxConnections))) {
+		return false;
+	}
+	return [...new Set(lane.targets.map((target) => target.id))].every((id) => {
+		const targetLanes = active.filter((reservation) => reservation.targets.some((target) => target.id === id));
+		const limit = Math.min(...lane.targets.filter((target) => target.id === id).map((target) => target.maxConnections),
+			...targetLanes.flatMap((reservation) => reservation.targets.filter((target) => target.id === id)
+				.map((target) => target.maxConnections)));
+		return targetLanes.length < limit;
+	});
 }
 
 export function selectRoomRecoveryCandidate(input: {

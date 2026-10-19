@@ -6,7 +6,7 @@
  * rewarded base share, excluding received redistribution.
  */
 
-export const PRISM_WEIGHT_FORMULA_VERSION = "tiered_weight_verified_uploaded_mib_x_fraud_report_reward_x_accumulated_allowance_x_sell_allowance_x_penalty_v8";
+export const PRISM_WEIGHT_FORMULA_VERSION = "tier_multiplier_verified_uploaded_mib_x_fraud_report_reward_x_accumulated_allowance_x_sell_allowance_x_penalty_v9";
 export const FRAUD_REPORT_BONUS_PERCENTAGES = { critical: 30, high: 20, medium: 10, low: 5 } as const;
 
 export function fraudReportReward(bonusPercentages: readonly number[]): number {
@@ -15,12 +15,12 @@ export function fraudReportReward(bonusPercentages: readonly number[]): number {
 
 export type EmissionTier = "A" | "B" | "C" | "D" | "E";
 
-const TIER_SHARES: Record<EmissionTier, number> = {
-	A: 0.5,
-	B: 0.35,
-	C: 0.1,
-	D: 0.04,
-	E: 0.01,
+const TIER_MULTIPLIERS: Record<EmissionTier, number> = {
+	A: 1,
+	B: 0.8,
+	C: 0.2,
+	D: 0.08,
+	E: 0.0075,
 };
 
 export interface TieredWeightInput {
@@ -37,7 +37,7 @@ export interface TieredWeightResult {
 	tiers: EmissionTier[];
 	tierCounts: Record<EmissionTier, number>;
 	tierRawTotals: Record<EmissionTier, number>;
-	effectiveTierShares: Record<EmissionTier, number>;
+	tierShares: Record<EmissionTier, number>;
 }
 
 export function computeRawScore(verifiedUploadedMib: number): number {
@@ -76,7 +76,6 @@ function tierForRank(rank: number, counts: Record<EmissionTier, number>): Emissi
  * Maps base raw scores to tiered normalized weights.
  *
  * Tier membership is based on base_raw descending with deterministic tie-breakers.
- * Tier B/C/D/E shares roll up to Tier A when that tier has no positive raw score.
  */
 export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[]): TieredWeightResult {
 	const n = candidates.length;
@@ -84,7 +83,7 @@ export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[
 	const tiers = new Array<EmissionTier>(n).fill("E");
 	const tierCounts = computeTierCounts(n);
 	const tierRawTotals: Record<EmissionTier, number> = { A: 0, B: 0, C: 0, D: 0, E: 0 };
-	const effectiveTierShares: Record<EmissionTier, number> = { ...TIER_SHARES };
+	const tierShares: Record<EmissionTier, number> = { A: 0, B: 0, C: 0, D: 0, E: 0 };
 
 	const ranked = candidates
 		.map((candidate, index) => ({
@@ -112,25 +111,16 @@ export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[
 	}
 
 	const sumRaw = tierRawTotals.A + tierRawTotals.B + tierRawTotals.C + tierRawTotals.D + tierRawTotals.E;
-	if (n === 0 || sumRaw <= 0 || tierRawTotals.A <= 0) {
-		return { weights, sumRaw, tiers, tierCounts, tierRawTotals, effectiveTierShares };
-	}
-
-	for (const tier of ["B", "C", "D", "E"] as const) {
-		if (tierCounts[tier] === 0 || tierRawTotals[tier] <= 0) {
-			effectiveTierShares.A += TIER_SHARES[tier];
-			effectiveTierShares[tier] = 0;
-		}
+	const sumWeighted = (Object.keys(tierRawTotals) as EmissionTier[])
+		.reduce((sum, tier) => sum + tierRawTotals[tier] * TIER_MULTIPLIERS[tier], 0);
+	if (n === 0 || !(sumWeighted > 0)) {
+		return { weights, sumRaw, tiers, tierCounts, tierRawTotals, tierShares };
 	}
 
 	let lastPositiveIndex = -1;
 	for (const candidate of ranked) {
 		if (candidate.rawScore <= 0) continue;
-		const tier = tiers[candidate.index]!;
-		const tierShare = effectiveTierShares[tier];
-		const tierRawTotal = tierRawTotals[tier];
-		if (tierShare <= 0 || tierRawTotal <= 0) continue;
-		weights[candidate.index] = tierShare * (candidate.rawScore / tierRawTotal);
+		weights[candidate.index] = (candidate.rawScore * TIER_MULTIPLIERS[tiers[candidate.index]!]) / sumWeighted;
 		lastPositiveIndex = candidate.index;
 	}
 
@@ -138,8 +128,9 @@ export function normalizeWeightsWithEmissionTiers(candidates: TieredWeightInput[
 		const total = sumWeights(weights);
 		weights[lastPositiveIndex] = Math.max(0, weights[lastPositiveIndex]! + (1 - total));
 	}
+	for (let index = 0; index < n; index++) tierShares[tiers[index]!] += weights[index]!;
 
-	return { weights, sumRaw, tiers, tierCounts, tierRawTotals, effectiveTierShares };
+	return { weights, sumRaw, tiers, tierCounts, tierRawTotals, tierShares };
 }
 
 export function sumWeights(weights: number[]): number {

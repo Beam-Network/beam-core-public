@@ -234,15 +234,15 @@ export function rankRoomCandidates(candidates: readonly OrchestratorCandidate[])
 }
 
 export function buildRoomInitialAllocation(candidates: readonly OrchestratorCandidate[], totalChunks: number,
-	maxSourceConnections: number): CandidateAllocation[] {
-	const selected = rankRoomCandidates(candidates).slice(0, Math.max(1, maxSourceConnections));
+	sourceLaneLimit: number): CandidateAllocation[] {
+	const selected = rankRoomCandidates(candidates).slice(0, Math.max(1, sourceLaneLimit));
 	const sizes = computePrismSlices(selected.map((candidate) => candidate.prismFinalScore), totalChunks);
 	return selected.flatMap((orchestrator, index) => sizes[index]! > 0 ? [{ orchestrator, chunkCount: sizes[index]! }] : []);
 }
 
 export interface RoomLaneReservation {
-	source: { id: string; maxConnections: number };
-	targets: readonly { id: string; maxConnections: number }[];
+	source: { id: string; laneLimit: number };
+	targets: readonly { id: string; laneLimit: number }[];
 	published: boolean;
 	terminal: boolean;
 }
@@ -251,14 +251,14 @@ export function canPublishRoomLane(lane: RoomLaneReservation, reservations: read
 	if (lane.published || lane.terminal) return false;
 	const active = reservations.filter((reservation) => reservation.published && !reservation.terminal);
 	const sources = active.filter((reservation) => reservation.source.id === lane.source.id);
-	if (sources.length >= Math.min(lane.source.maxConnections, ...sources.map((reservation) => reservation.source.maxConnections))) {
+	if (sources.length >= Math.min(lane.source.laneLimit, ...sources.map((reservation) => reservation.source.laneLimit))) {
 		return false;
 	}
 	return [...new Set(lane.targets.map((target) => target.id))].every((id) => {
 		const targetLanes = active.filter((reservation) => reservation.targets.some((target) => target.id === id));
-		const limit = Math.min(...lane.targets.filter((target) => target.id === id).map((target) => target.maxConnections),
+		const limit = Math.min(...lane.targets.filter((target) => target.id === id).map((target) => target.laneLimit),
 			...targetLanes.flatMap((reservation) => reservation.targets.filter((target) => target.id === id)
-				.map((target) => target.maxConnections)));
+				.map((target) => target.laneLimit)));
 		return targetLanes.length < limit;
 	});
 }
@@ -266,7 +266,7 @@ export function canPublishRoomLane(lane: RoomLaneReservation, reservations: read
 export function selectRoomRecoveryCandidate(input: {
 	candidates: readonly OrchestratorCandidate[];
 	failureCounts: ReadonlyMap<string, number>;
-	maxSourceConnections: number;
+	sourceLaneLimit: number;
 	cycle: number;
 	usedOrchestratorIds: ReadonlySet<string>;
 }): { orchestrator: OrchestratorCandidate; cycle: number; reset: boolean } | null {
@@ -274,7 +274,7 @@ export function selectRoomRecoveryCandidate(input: {
 	if (!ordered.length) return null;
 	const fewest = Math.min(...ordered.map((candidate) => input.failureCounts.get(candidate.id) ?? 0));
 	const cohort = ordered.filter((candidate) => (input.failureCounts.get(candidate.id) ?? 0) === fewest)
-		.slice(0, Math.max(1, input.maxSourceConnections));
+		.slice(0, Math.max(1, input.sourceLaneLimit));
 	const unused = cohort.find((candidate) => !input.usedOrchestratorIds.has(candidate.id));
 	return { orchestrator: unused ?? cohort[0]!, cycle: input.cycle + (unused ? 0 : 1), reset: !unused };
 }

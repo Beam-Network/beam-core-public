@@ -57,6 +57,10 @@ export function normalizePoints(points:string,lowest:string,highest:string,lowes
   const bottom=scaleBottom(lowest,lowestVariance);
   return Math.max(0,Math.min(1,Number(p-bottom)/Number(hi-bottom)));
 }
+export function reliability(promoted:boolean,reliableTasks:number,accountableTasks:number):number {
+  if(promoted||!(accountableTasks>0))return 1;
+  return Math.max(0,Math.min(1,reliableTasks/accountableTasks));
+}
 export function verifiedGoodput(bytes:number,durationMs:number|null):number|null {
   return durationMs!==null&&Number.isFinite(durationMs)&&durationMs>0&&Number.isFinite(bytes)&&bytes>=0?bytes*8/durationMs/1000:null;
 }

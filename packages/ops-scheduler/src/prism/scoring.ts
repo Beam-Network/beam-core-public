@@ -38,9 +38,18 @@ export function stake(n:number,fleet:number):string {
   if(!Number.isInteger(n)||!Number.isInteger(fleet)||fleet<n)throw new Error('Invalid fleet');
   return String(5+(fleet===2?10:Math.round(10*(n-2)/(fleet-2))));
 }
+export function duelStake(waveStake:string,upper:AssignmentResult,lower:AssignmentResult):string {
+  const base=Number(waveStake);
+  if(!base||!upper.accountableTasks||!lower.accountableTasks||!upper.successfulTasks)return waveStake;
+  if(BigInt(upper.successfulTasks)*BigInt(lower.accountableTasks)!==BigInt(lower.successfulTasks)*BigInt(upper.accountableTasks))return waveStake;
+  if(upper.durationMs===null||lower.durationMs===null||!Number.isFinite(upper.durationMs)||!Number.isFinite(lower.durationMs))return waveStake;
+  const faster=Math.min(upper.durationMs,lower.durationMs),slower=Math.max(upper.durationMs,lower.durationMs);
+  return String(Math.round(base*(faster>0?Math.min(8,1+Math.log2(slower/faster)):8)));
+}
 export const RECOVERY_FAILURE_STAKES=3;
-export function recoveryCharge(firstWaveStake:string,failedRecoveries:number):string {
-  return String(-RECOVERY_FAILURE_STAKES*Number(firstWaveStake)*failedRecoveries);
+export const UNCHARGED_RECOVERY_REASONS=['no_delivery_cut','tail_cut'] as const;
+export function recoveryCharge(firstWaveStake:string,chargedRecoveries:number):string {
+  return String(-RECOVERY_FAILURE_STAKES*Number(firstWaveStake)*chargedRecoveries);
 }
 export function transferWideFailure(outcomes:readonly AssignmentResult[]):boolean {
   const rated=outcomes.filter(o=>o.accountableTasks>0);
